@@ -3,7 +3,34 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import type { Task, LaolConfig } from "../data/models";
 
-const SHELL = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : "/bin/sh";
+const WIN32 = process.platform === "win32";
+
+/**
+ * Resolve the Claude Code binary to its actual executable path.
+ *
+ * On Windows, `claude` is a .cmd/.bat wrapper, and spawn() with shell: true
+ * causes cmd.exe to interpret backslash sequences in the prompt argument
+ * (e.g. "D:\agentProjet\backend" → \a BEL, \b BS, corrupting the text).
+ *
+ * We resolve the .cmd extension explicitly so we can spawn without a shell,
+ * preserving the prompt text verbatim.
+ */
+function resolveClaudeBinary(binaryPath: string): string {
+  if (!WIN32) return binaryPath;
+
+  // Try .cmd first (most common on Windows), then .bat, then raw
+  for (const ext of [".cmd", ".bat", ""]) {
+    const candidate = binaryPath + ext;
+    try {
+      execSync(`where "${candidate}"`, { stdio: "pipe", timeout: 5000 });
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  // Fallback: return as-is and let the spawn error handler surface the issue
+  return binaryPath;
+}
 
 /**
  * Result of a Claude Code execution.
@@ -36,8 +63,11 @@ export class ClaudeCodeExecutor {
   private effort: string;
   private skipPermissions: boolean;
 
+  private resolvedBinary: string;
+
   constructor(claudeConfig: LaolConfig["claude_executor"]) {
     this.binaryPath = claudeConfig.binary_path;
+    this.resolvedBinary = resolveClaudeBinary(this.binaryPath);
     this.timeoutSeconds = claudeConfig.timeout_seconds;
     this.maxBudgetUsd = claudeConfig.max_budget_usd;
     this.allowedTools = claudeConfig.allowed_tools;
@@ -62,7 +92,7 @@ export class ClaudeCodeExecutor {
     const startTime = Date.now();
     const discoveryPrompt = this.buildDiscoveryPrompt(worktreePath, task);
 
-    const child = spawn(this.binaryPath, [
+    const child = spawn(this.resolvedBinary, [
       "-p", discoveryPrompt,
       "--output-format", "text",
       "--allowedTools", "Read, Glob, Grep",
@@ -71,7 +101,6 @@ export class ClaudeCodeExecutor {
     ], {
       cwd: worktreePath,
       stdio: ["ignore", "pipe", "pipe"],
-      shell: process.platform === "win32",
     });
 
     return new Promise((resolve) => {
@@ -156,12 +185,10 @@ export class ClaudeCodeExecutor {
       let timedOut = false;
       let settled = false;
 
-      const child: ChildProcess = spawn(this.binaryPath, args, {
+      const child: ChildProcess = spawn(this.resolvedBinary, args, {
         cwd: worktreePath,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env },
-        // On Windows, shell: true helps find .cmd/.bat executables
-        shell: process.platform === "win32",
       });
 
       const timer = setTimeout(() => {
@@ -379,10 +406,9 @@ export class ClaudeCodeExecutor {
 
   private binaryExists(): boolean {
     try {
-      execSync(`"${this.binaryPath}" --version`, {
+      execSync(`"${this.resolvedBinary}" --version`, {
         stdio: "pipe",
         timeout: 5000,
-        shell: SHELL,
       });
       return true;
     } catch {
