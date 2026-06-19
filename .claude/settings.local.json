@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(node bin/laol.js --help)",
+      "Bash(node bin/laol.js init)",
+      "Bash(node bin/laol.js task --help)",
+      "Bash(node bin/laol.js task add --description \"Refactor login flow in auth module\" --files \"src/auth.ts\" \"src/utils/validator.ts\")",
+      "Bash(node bin/laol.js task list)",
+      "Bash(node bin/laol.js status)",
+      "Bash(node bin/laol.js locks list)",
+      "Bash(node bin/laol.js config show)",
+      "Bash(npx vitest:*)",
+      "Bash(npx tsx:*)",
+      "Bash(node -e \"require\\('./src/cli/commands.ts'\\)\")",
+      "Bash(npx ts-node:*)",
+      "Bash(npx --yes tsx src/cli/commands.ts merge --help)",
+      "Bash(node:*)",
+      "Bash(ls -la \"D:\\\\LAOL\\\\.multiagent\"/*/)"
+    ]
+  }
+}
