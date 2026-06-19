@@ -1,8 +1,8 @@
 # LAOL — Multi-Agent Collaborative Coding System
 
-LAOL lets multiple Claude Code AI agents safely modify the same codebase **in parallel**, using file-system-level atomic locks, Git worktree isolation, and AI-powered semantic merge.
+> **Zero databases. Zero message queues.** File-system-level atomic locks. Git worktree isolation. AI-powered semantic merge. Agents auto-discover files at runtime.
 
-**Zero databases. Zero message queues.** Everything is plain JSON files, `rename(2)` atomicity, and TCP localhost IPC.
+LAOL lets multiple Claude Code AI agents safely modify the same codebase **in parallel**. Agents dynamically discover which files to edit — no need to pre-declare targets. The scheduler handles lock acquisition on-demand, so agents can expand their scope mid-task without conflicts.
 
 ## Architecture
 
@@ -57,7 +57,9 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
 | Mechanism | What it does |
 |-----------|-------------|
 | **Two-Phase Commit Lock** | All target files locked atomically via `staging/` → `locks/` rename. If any file is taken, the entire batch rolls back — no partial lock sets. |
+| **Dynamic Lock Expansion** | Agents request locks on-demand during execution via TCP. Discovered a new dependency mid-task? Request a lock — granted or denied in real time. |
 | **Conflict Pre-Check** | Before assigning a task, the scheduler checks whether any target file is already locked. Blocked tasks stay `pending`. |
+| **Auto-Discovery** | No `--files`? No problem. Agents explore the codebase, identify target files, request locks, then proceed — all automatically. |
 | **Graded TTL Leases** | New locks: 60s TTL. After 2 successful renewals: 180s TTL. If an agent crashes, locks auto-expire within 90s (not 300s). |
 | **Semantic Warnings** | When Agent A modifies a module's exports, Agent B gets a context hint before editing that module. |
 | **Agent Circuit Breaker** | 2 consecutive failures → degraded (simple tasks only). 5 → quarantined (no tasks). Prevents broken agents from burning API costs. |
@@ -115,13 +117,16 @@ laol agent start --id agent-002
 ### 4. Create a task
 
 ```bash
-# Terminal 4
+# With pre-declared files:
 laol task add --description "Refactor the auth module to use async/await" \
               --files "src/auth.ts" "src/auth.test.ts"
 
+# Or let the agent discover files automatically:
+laol task add --description "Fix all TypeScript errors in the project"
+
 # Task created: 3f7a9b2c-...
 #   Status: pending
-#   Files: src/auth.ts, src/auth.test.ts
+#   Files: src/auth.ts, src/auth.test.ts  (or "auto-discover")
 ```
 
 ### 5. Watch it work
@@ -149,7 +154,7 @@ Initialize `.multiagent/` in the current repository.
 
 | Command | Description |
 |---------|-------------|
-| `laol task add --description "..." --files <paths...>` | Create a new task |
+| `laol task add --description "..." [--files <paths...>]` | Create a task (files optional — agents auto-discover) |
 | `laol task list [--status pending\|done\|failed] [--agent <id>]` | List tasks |
 | `laol task show <task-id>` | Show task details |
 | `laol task cancel <task-id>` | Cancel a pending task |
@@ -290,7 +295,7 @@ AgentRunner.handleTaskAssigned(msg)
 ```bash
 npm install
 npm run build       # TypeScript → dist/
-npm test            # Vitest (47 tests, 6 files)
+npm test            # Vitest (197 tests, 16 files)
 npm run dev         # Watch mode
 ```
 
@@ -309,7 +314,7 @@ src/
 ├── wal/             # Write-ahead log for crash recovery
 ├── registry/        # Semantic change registry (module export tracking)
 ├── cli/             # Commander-based CLI (7 command groups)
-└── __tests__/       # 6 test files, 47 tests
+└── __tests__/       # 16 test files, 197 tests
 ```
 
 ## License

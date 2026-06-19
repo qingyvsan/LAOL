@@ -1,7 +1,7 @@
 {
   "name": "laol",
   "version": "0.1.0",
-  "description": "Multi-agent collaborative coding system with atomic file locks and AI semantic merge",
+  "description": "Multi-agent collaborative coding system. Agents auto-discover target files, acquire atomic locks on-demand, and work in parallel with AI-powered semantic merge — zero databases, zero message queues.",
   "main": "dist/index.js",
   "bin": {
     "laol": "./bin/laol.js"
