@@ -2,3 +2,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 .env
+
+# Design docs (local only)
+项目设计方案.md
+项目逻辑.md
+项目逻辑模块补充.md
+项目逻辑优化方案.md
