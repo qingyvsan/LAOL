@@ -8,12 +8,12 @@ const WIN32 = process.platform === "win32";
 /**
  * Resolve the Claude Code binary to its actual executable path.
  *
- * On Windows, `claude` is a .cmd/.bat wrapper, and spawn() with shell: true
- * causes cmd.exe to interpret backslash sequences in the prompt argument
- * (e.g. "D:\agentProjet\backend" → \a BEL, \b BS, corrupting the text).
+ * On Windows, `claude` is a .cmd/.bat wrapper. We resolve the extension
+ * explicitly so spawn() can find the executable.
  *
- * We resolve the .cmd extension explicitly so we can spawn without a shell,
- * preserving the prompt text verbatim.
+ * The prompt itself is piped via stdin rather than passed as a -p argument,
+ * which avoids any risk of Windows command-line escaping corrupting
+ * backslash sequences in file paths.
  */
 function resolveClaudeBinary(binaryPath: string): string {
   if (!WIN32) return binaryPath;
@@ -45,8 +45,10 @@ export interface ClaudeExecutionResult {
 }
 
 /**
- * ClaudeCodeExecutor — spawns `claude -p` in the agent's isolated worktree.
+ * ClaudeCodeExecutor — spawns `claude` in the agent's isolated worktree.
  *
+ * The prompt is piped via stdin (not the -p flag) to avoid Windows
+ * command-line escaping of backslash sequences in file paths.
  * Builds a structured prompt from the task context, sets the appropriate
  * CLI flags for non-interactive automated execution, and captures output.
  *
@@ -93,15 +95,18 @@ export class ClaudeCodeExecutor {
     const discoveryPrompt = this.buildDiscoveryPrompt(worktreePath, task);
 
     const child = spawn(this.resolvedBinary, [
-      "-p", discoveryPrompt,
       "--output-format", "text",
       "--allowedTools", "Read, Glob, Grep",
       "--effort", "low",
       "--dangerously-skip-permissions",
     ], {
       cwd: worktreePath,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+
+    // Pipe prompt via stdin to avoid Windows command-line escaping issues
+    child.stdin!.write(discoveryPrompt);
+    child.stdin!.end();
 
     return new Promise((resolve) => {
       let stdout = "";
@@ -153,7 +158,7 @@ export class ClaudeCodeExecutor {
   ): Promise<ClaudeExecutionResult> {
     const startTime = Date.now();
     const prompt = this.buildPrompt(worktreePath, task, contextHints);
-    const args = this.buildArgs(prompt);
+    const args = this.buildArgs();
 
     // Verify binary exists (fail fast with clear message)
     if (!this.binaryExists()) {
@@ -187,9 +192,13 @@ export class ClaudeCodeExecutor {
 
       const child: ChildProcess = spawn(this.resolvedBinary, args, {
         cwd: worktreePath,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
       });
+
+      // Pipe prompt via stdin to avoid Windows command-line escaping issues
+      child.stdin!.write(prompt);
+      child.stdin!.end();
 
       const timer = setTimeout(() => {
         timedOut = true;
@@ -374,11 +383,12 @@ export class ClaudeCodeExecutor {
 
   // ---- CLI argument building ----
 
-  private buildArgs(prompt: string): string[] {
+  private buildArgs(): string[] {
     const args: string[] = [];
 
-    // Non-interactive print mode
-    args.push("-p", prompt);
+    // Prompt is piped via stdin (not passed as -p argument) to avoid
+    // Windows command-line escaping of backslash sequences in paths.
+    // Claude Code reads stdin when it detects a non-TTY input.
 
     // Output format — text is simpler to capture
     args.push("--output-format", "text");
