@@ -74,13 +74,20 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
 ## Installation
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/qingyvsan/LAOL.git
 cd LAOL
 npm install
 npm run build
+npm link        # registers "laol" globally on your PATH
 ```
 
-**Prerequisite:** [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and available on your `PATH`.
+After `npm link`, the `laol` command is available from any directory.
+
+To unlink later: `npm unlink -g laol`
+
+**Prerequisites:**
+- [Node.js](https://nodejs.org/) >= 18
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) must be installed and available on your `PATH`
 
 ## Quick Start
 
