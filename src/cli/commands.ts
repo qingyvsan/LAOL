@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
@@ -386,6 +387,49 @@ program
       agents: 0, // agents tracked in-process, CLI has no live view
       worktreePool: { available: poolTotal, in_use: 0 },
     }));
+  });
+
+// ---- laol shutdown ----
+
+program
+  .command("shutdown")
+  .description("Gracefully stop all agents, the scheduler, and clean up worktrees")
+  .option("--port <number>", "Scheduler port", "9123")
+  .option("--host <host>", "Scheduler host", "127.0.0.1")
+  .action(async (options) => {
+    const port = parseInt(options.port, 10);
+    const host = options.host;
+
+    console.log(chalk.yellow("Sending shutdown signal to scheduler..."));
+
+    const socket = new net.Socket();
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.connect(port, host, () => {
+          socket.write(JSON.stringify({ type: "shutdown" }) + "\n");
+          // Give the scheduler a moment to receive and process
+          setTimeout(() => {
+            socket.destroy();
+            resolve();
+          }, 1000);
+        });
+
+        socket.on("error", (err: NodeJS.ErrnoException) => {
+          if (err.code === "ECONNREFUSED") {
+            reject(new Error(`No scheduler running at ${host}:${port}`));
+          } else {
+            reject(err);
+          }
+        });
+      });
+
+      console.log(chalk.green("Shutdown signal sent."));
+      console.log(chalk.dim("Scheduler and all agents should exit within a few seconds."));
+    } catch (err) {
+      console.error(chalk.red(`Failed to send shutdown signal: ${(err as Error).message}`));
+      process.exit(1);
+    }
   });
 
 // ---- laol merge ----

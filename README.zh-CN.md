@@ -196,6 +196,12 @@ laol status
 
 显示系统概览：任务数量、锁数量、池使用情况。
 
+### `laol shutdown`
+
+| 命令 | 说明 |
+|------|------|
+| `laol shutdown [--port 9123] [--host 127.0.0.1]` | 优雅关闭调度器、所有智能体，并清理 worktree |
+
 ## 配置
 
 `.multiagent/config.json`（由 `laol init` 创建）：

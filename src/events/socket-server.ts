@@ -13,6 +13,7 @@ import { EventEmitter } from "node:events";
  *
  * Server → Agent:
  *   {"type":"ping"}
+ *   {"type":"shutdown"}
  *   {"type":"lock_released","file":"src/auth.ts"}
  *   {"type":"merge_completed","task_id":"uuid"}
  *   {"type":"warning","task_id":"uuid","message":"..."}
@@ -287,6 +288,11 @@ export class SocketServer extends EventEmitter {
         const files = msg.files as string[] ?? [];
         if (!agentId || !taskId || files.length === 0) return;
         this.emit("lock_request", agentId, taskId, files);
+        break;
+      }
+
+      case "shutdown": {
+        this.emit("shutdown_requested");
         break;
       }
 

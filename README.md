@@ -196,6 +196,12 @@ Initialize `.multiagent/` in the current repository.
 
 Show system overview: task counts, lock count, pool usage.
 
+### `laol shutdown`
+
+| Command | Description |
+|---------|-------------|
+| `laol shutdown [--port 9123] [--host 127.0.0.1]` | Gracefully stop the scheduler, all agents, and clean up worktrees |
+
 ## Configuration
 
 `.multiagent/config.json` (created by `laol init`):

@@ -116,6 +116,10 @@ export class AgentRunner {
       console.log(`[runner] Locks denied for ${files.join(", ")}: ${reason}`);
     });
 
+    this.socketClient.on("shutdown", () => {
+      this.handleShutdown();
+    });
+
     // Connect to scheduler
     await this.socketClient.connect();
   }
@@ -138,6 +142,37 @@ export class AgentRunner {
         metadata: { agent_stopped_at: Date.now() },
       }));
     }
+  }
+
+  /**
+   * Handle a shutdown signal from the scheduler.
+   * Mark the current task as pending, release locks, clean worktrees, and exit.
+   */
+  private async handleShutdown(): Promise<void> {
+    console.log(`[runner] Shutdown received — stopping agent "${this.agentId}" gracefully...`);
+
+    this.running = false;
+
+    // Mark current task as pending (so it can be picked up later)
+    if (this.currentTask) {
+      this.taskStore.updateTask(this.currentTask.id, () => ({
+        status: "pending",
+        assigned_agent: null,
+        metadata: { agent_stopped_at: Date.now() },
+      }));
+    }
+
+    // Release all held locks
+    this.lockManager.releaseAllForAgent(this.agentId);
+
+    // Clean up and remove all worktree directories
+    this.worktreePool.shutdown();
+
+    // Disconnect from scheduler
+    this.socketClient.disconnect();
+
+    console.log(`[runner] Agent "${this.agentId}" shut down.`);
+    process.exit(0);
   }
 
   // ---- Task handling ----

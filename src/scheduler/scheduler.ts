@@ -138,6 +138,10 @@ export class Scheduler {
       this.handleLockRequest(agentId, taskId, files);
     });
 
+    this.socketServer.on("shutdown_requested", () => {
+      this.handleShutdown();
+    });
+
     // 4. Wire up internal event bus
     this.eventBus.on("task_created", (task: Task) => {
       this.tryAssignTask(task);
@@ -546,6 +550,44 @@ export class Scheduler {
     // Grant the locks
     this.socketServer.sendLockGranted(agentId, taskId, files);
     console.log(`[scheduler] Lock request granted for agent ${agentId}: ${files.join(", ")}`);
+  }
+
+  /**
+   * Handle a shutdown request — broadcast to all agents, wait for cleanup,
+   * then stop all services and exit.
+   */
+  private async handleShutdown(): Promise<void> {
+    console.log("[scheduler] Shutdown requested — notifying all agents...");
+
+    // Notify all connected agents to shut down
+    this.socketServer.broadcast({ type: "shutdown" });
+
+    // Give agents time to clean up and disconnect
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Clean up worktree directories left by agents
+    this.cleanupWorktrees();
+
+    // Graceful stop
+    await this.stop();
+
+    console.log("[scheduler] All services stopped. Exiting.");
+    process.exit(0);
+  }
+
+  /**
+   * Remove all worktree directories from disk.
+   */
+  private cleanupWorktrees(): void {
+    const worktreesDir = path.join(this.repoRoot, ".multiagent", "worktrees");
+    if (fs.existsSync(worktreesDir)) {
+      try {
+        fs.rmSync(worktreesDir, { recursive: true, force: true });
+        console.log("[scheduler] Worktree directories cleaned up.");
+      } catch {
+        console.log("[scheduler] Warning: could not fully clean worktree directories.");
+      }
+    }
   }
 
   // ---- Helpers ----
