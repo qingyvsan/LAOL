@@ -267,10 +267,13 @@ export class AgentWorker {
         return;
       }
 
-      execSync(`git commit -m "Task: ${task.description.slice(0, 72)}"`, {
+      // Pipe commit message via stdin to avoid shell injection
+      // from task descriptions containing quotes, backticks, or $().
+      execSync(`git commit -F -`, {
         cwd: worktreePath,
         stdio: "pipe",
         timeout: 10_000,
+        input: `Task: ${task.description.slice(0, 72)}`,
       });
 
       console.log(`[agent ${this.agentId}] Changes committed`);

@@ -29,6 +29,10 @@ export class HealthMonitor {
   // Ping response timeout (ms)
   private readonly PING_RESPONSE_TIMEOUT_MS = 5000;
 
+  // Callback invoked when health monitor wants to ping an agent.
+  // The scheduler wires this to socketServer.pingAgent().
+  private onPingRequest: ((agentId: string) => void) | null = null;
+
   constructor(
     lockManager: LockManager,
     leaseManager: LeaseManager,
@@ -39,6 +43,15 @@ export class HealthMonitor {
     this.leaseManager = leaseManager;
     this.eventBus = eventBus;
     this.intervalMs = intervalMs;
+  }
+
+  /**
+   * Register a callback that sends a ping to an agent.
+   * Called when the health monitor detects an overdue heartbeat and wants
+   * to probe whether the agent is still alive.
+   */
+  setOnPingRequest(cb: (agentId: string) => void): void {
+    this.onPingRequest = cb;
   }
 
   /**
@@ -108,21 +121,15 @@ export class HealthMonitor {
     // Check if we already sent a ping to this agent recently
     const lastPing = this.pendingPings.get(lock.holder);
     if (lastPing) {
-      // Ping was sent but no response — give it more time
+      // Ping was sent but no response — check if timed out
       const pingAge = Date.now() - lastPing;
       if (pingAge >= this.PING_RESPONSE_TIMEOUT_MS) {
-        // Agent is unresponsive — force release all its locks
+        // Agent is unresponsive — delegate cleanup to scheduler
         console.log(
           `[health] Agent "${lock.holder}" unresponsive (${Math.round(pingAge / 1000)}s since ping), ` +
-          `releasing all locks`
+          `marking as lost`
         );
-
-        const released = this.lockManager.releaseAllForAgent(lock.holder);
         this.pendingPings.delete(lock.holder);
-
-        for (const file of released) {
-          this.eventBus.emit("lock_expired", file);
-        }
         this.eventBus.emit("heartbeat_lost", lock.holder);
       }
       return;
@@ -135,20 +142,29 @@ export class HealthMonitor {
     );
 
     this.pendingPings.set(lock.holder, Date.now());
-    // Note: the actual ping is sent via SocketServer; the scheduler wires
-    // this up by listening to the heartbeat_lost-warning internally.
-    // The health monitor just tracks the ping state.
+
+    // Send the actual ping via the registered callback
+    if (this.onPingRequest) {
+      this.onPingRequest(lock.holder);
+    }
   }
 
   /**
-   * Check for pings that have timed out.
+   * Check for pings that have timed out and weren't caught by the
+   * per-lock overdue check (e.g. agent's locks were all force-released
+   * in a previous cycle but the ping tracking still has the agent).
    */
   private checkPendingPings(): void {
     const now = Date.now();
 
     for (const [agentId, pingTime] of this.pendingPings) {
       if (now - pingTime >= this.PING_RESPONSE_TIMEOUT_MS) {
-        // Already handled in handleOverdueHeartbeat on next cycle
+        console.log(
+          `[health] Agent "${agentId}" unresponsive to ping (${Math.round((now - pingTime) / 1000)}s), ` +
+          `marking as lost`
+        );
+        this.pendingPings.delete(agentId);
+        this.eventBus.emit("heartbeat_lost", agentId);
       }
     }
   }

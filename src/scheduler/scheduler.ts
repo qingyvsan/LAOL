@@ -109,7 +109,12 @@ export class Scheduler {
     const port = await this.socketServer.start();
     console.log(`[scheduler] Listening on 127.0.0.1:${port}`);
 
-    // 3. Wire up socket server events
+    // 3. Wire health monitor ping → actual socket ping
+    this.healthMonitor.setOnPingRequest((agentId: string) => {
+      this.socketServer.pingAgent(agentId);
+    });
+
+    // 4. Wire up socket server events
     this.socketServer.on("agent_connected", (agentId: string) => {
       this.handleAgentConnected(agentId);
     });
@@ -207,8 +212,19 @@ export class Scheduler {
     if (task.dependency) {
       const depTask = this.taskStore.getTask(task.dependency);
       if (!depTask || depTask.status !== "done") {
-        // Dependency not resolved — leave pending
+        const reason = !depTask
+          ? `Dependency task ${task.dependency.slice(0, 8)} not found`
+          : depTask.status === "failed" || depTask.status === "stuck"
+            ? `Dependency task ${task.dependency.slice(0, 8)} is ${depTask.status}`
+            : `Waiting for dependency task ${task.dependency.slice(0, 8)} (status: ${depTask.status})`;
+        this.writeBlockedMetadata(task, reason);
         return;
+      }
+      // Dependency resolved — clear any previous blocked metadata
+      if (task.metadata?.blocked_reason) {
+        this.taskStore.updateTask(task.id, (t) => ({
+          metadata: { ...t.metadata, blocked_reason: undefined },
+        }));
       }
     }
 
@@ -219,6 +235,8 @@ export class Scheduler {
       for (const file of task.target_files) {
         this.addWaitingTask(file, task.id);
       }
+
+      this.writeBlockedMetadata(task, conflictResult.reason ?? "Lock conflict detected");
 
       // If semantic warning, update task metadata
       if (conflictResult.warnings) {
@@ -237,7 +255,7 @@ export class Scheduler {
     // 2. Find an idle agent
     const idleAgent = this.findIdleAgent();
     if (!idleAgent) {
-      // No idle agents — task stays pending, will be picked up when agent frees up
+      this.writeBlockedMetadata(task, "No idle agent available");
       return;
     }
 
@@ -245,42 +263,58 @@ export class Scheduler {
     const complexity = task.target_files.length;
     const breakerResult = this.circuitBreaker.canAcceptTask(idleAgent, complexity);
     if (!breakerResult.can) {
-      // This specific agent can't take it — try another or leave pending
+      this.writeBlockedMetadata(task, breakerResult.reason ?? "Circuit breaker blocked assignment");
       return;
     }
 
-    // 4. Acquire locks (atomic two-phase commit) — skip if no target files
+    // 4. Acquire locks + update task state (WAL-protected for crash recovery)
+    let updated: Task | null = null;
     let locks: string[] = [];
-    if (task.target_files.length > 0) {
-      const acquireResult = this.lockManager.acquire(task.id, idleAgent, task.target_files);
-      if (!acquireResult.success) {
-        // Lock conflict — track waiting and leave pending
-        for (const file of task.target_files) {
-          this.addWaitingTask(file, task.id);
+
+    try {
+      this.walManager.write({ op: "assign", task: task.id, agent: idleAgent, files: task.target_files });
+
+      // Acquire locks (atomic two-phase commit) — skip if no target files
+      if (task.target_files.length > 0) {
+        const acquireResult = this.lockManager.acquire(task.id, idleAgent, task.target_files, this.leaseManager.INITIAL_TTL_MS);
+        if (!acquireResult.success) {
+          this.walManager.write({ op: "fail", task: task.id, reason: acquireResult.reason ?? "Lock conflict" });
+          // Lock conflict — track waiting and leave pending
+          for (const file of task.target_files) {
+            this.addWaitingTask(file, task.id);
+          }
+          return;
         }
+        locks = acquireResult.locks?.map((l) => l.file) ?? [];
+        this.agentLocks.set(idleAgent, new Set(locks));
+      } else {
+        this.agentLocks.set(idleAgent, new Set());
+      }
+
+      // Update task state
+      updated = this.taskStore.updateTask(task.id, (t) => ({
+        status: "in_progress",
+        assigned_agent: idleAgent,
+        metadata: {
+          ...t.metadata,
+          risk_level: conflictResult.risk_level ?? "low",
+          warnings: conflictResult.warnings ?? [],
+        },
+      }));
+
+      if (!updated) {
+        this.walManager.write({ op: "fail", task: task.id, reason: "Version conflict on task update" });
+        // Version conflict — rollback locks
+        for (const file of locks) {
+          this.lockManager.release(file);
+        }
+        this.agentLocks.delete(idleAgent);
         return;
       }
-      locks = acquireResult.locks?.map((l) => l.file) ?? [];
-      // Track locks per agent
-      this.agentLocks.set(idleAgent, new Set(locks));
-    } else {
-      // No files to lock — agent will discover and request locks dynamically
-      this.agentLocks.set(idleAgent, new Set());
-    }
 
-    // 5. Update task state
-    const updated = this.taskStore.updateTask(task.id, (t) => ({
-      status: "in_progress",
-      assigned_agent: idleAgent,
-      metadata: {
-        ...t.metadata,
-        risk_level: conflictResult.risk_level ?? "low",
-        warnings: conflictResult.warnings ?? [],
-      },
-    }));
-
-    if (!updated) {
-      // Version conflict — rollback locks
+      this.walManager.write({ op: "commit", task: task.id });
+    } catch (err) {
+      this.walManager.write({ op: "fail", task: task.id, reason: err instanceof Error ? err.message : String(err) });
       for (const file of locks) {
         this.lockManager.release(file);
       }
@@ -499,6 +533,28 @@ export class Scheduler {
     if (agentState !== "quarantined") {
       this.assignNextPending();
     }
+
+    // Cascade failure to dependent tasks
+    this.cascadeDependencyFailure(taskId, `dependency "${taskId.slice(0, 8)}" failed: ${reason}`);
+  }
+
+  /**
+   * Recursively fail all tasks that depend on a failed task.
+   */
+  private cascadeDependencyFailure(failedTaskId: string, reason: string): void {
+    const dependents = this.taskStore.findDependents(failedTaskId);
+    for (const dep of dependents) {
+      if (dep.status === "pending") {
+        this.taskStore.updateTask(dep.id, () => ({
+          status: "failed",
+          metadata: { failure_reason: reason },
+        }));
+        console.log(`[scheduler] Task ${dep.id.slice(0, 8)} failed (dependency cascade)`);
+        this.eventBus.emit("task_failed", dep, reason);
+        // Recursively cascade
+        this.cascadeDependencyFailure(dep.id, `dependency "${dep.id.slice(0, 8)}" failed: upstream dependency failed`);
+      }
+    }
   }
 
   private handleMergeRequired(task: Task): void {
@@ -534,23 +590,33 @@ export class Scheduler {
       return;
     }
 
-    // Acquire locks atomically
-    const acquireResult = this.lockManager.acquire(taskId, agentId, newFiles);
-    if (!acquireResult.success) {
-      this.socketServer.sendLockDenied(agentId, taskId, newFiles, acquireResult.reason ?? "Lock acquisition failed");
-      return;
-    }
+    // Acquire locks atomically (WAL-protected)
+    try {
+      this.walManager.write({ op: "acquire_lock", task: taskId, agent: agentId, files: newFiles });
 
-    // Track new locks
-    const acquiredFiles = acquireResult.locks?.map((l) => l.file) ?? [];
-    for (const file of acquiredFiles) {
-      currentLocks.add(file);
-    }
-    this.agentLocks.set(agentId, currentLocks);
+      const acquireResult = this.lockManager.acquire(taskId, agentId, newFiles, this.leaseManager.INITIAL_TTL_MS);
+      if (!acquireResult.success) {
+        this.walManager.write({ op: "fail", task: taskId, reason: acquireResult.reason ?? "Lock acquisition failed" });
+        this.socketServer.sendLockDenied(agentId, taskId, newFiles, acquireResult.reason ?? "Lock acquisition failed");
+        return;
+      }
 
-    // Grant the locks
-    this.socketServer.sendLockGranted(agentId, taskId, files);
-    console.log(`[scheduler] Lock request granted for agent ${agentId}: ${files.join(", ")}`);
+      this.walManager.write({ op: "commit", task: taskId });
+
+      // Track new locks
+      const acquiredFiles = acquireResult.locks?.map((l) => l.file) ?? [];
+      for (const file of acquiredFiles) {
+        currentLocks.add(file);
+      }
+      this.agentLocks.set(agentId, currentLocks);
+
+      // Grant the locks
+      this.socketServer.sendLockGranted(agentId, taskId, files);
+      console.log(`[scheduler] Lock request granted for agent ${agentId}: ${files.join(", ")}`);
+    } catch (err) {
+      this.walManager.write({ op: "fail", task: taskId, reason: err instanceof Error ? err.message : String(err) });
+      this.socketServer.sendLockDenied(agentId, taskId, newFiles, "Internal error during lock acquisition");
+    }
   }
 
   /**
@@ -621,6 +687,17 @@ export class Scheduler {
         break; // assign one at a time
       }
     }
+  }
+
+  /**
+   * Write a blocked_reason into task metadata so users can see
+   * why a task is stuck in pending. Only writes if the reason changed.
+   */
+  private writeBlockedMetadata(task: Task, reason: string): void {
+    if (task.metadata?.blocked_reason === reason) return; // avoid write churn
+    this.taskStore.updateTask(task.id, () => ({
+      metadata: { ...task.metadata, blocked_reason: reason, blocked_at: Date.now() },
+    }));
   }
 
   private addWaitingTask(file: string, taskId: string): void {

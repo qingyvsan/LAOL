@@ -22,6 +22,24 @@ export class TaskStore {
   // ---- Public API ----
 
   /**
+   * Validate target file paths for path traversal and system file access.
+   * Throws on invalid paths; returns silently on valid ones.
+   */
+  static validateTargetFiles(files: string[]): void {
+    for (const file of files) {
+      if (path.isAbsolute(file)) {
+        throw new Error(`Invalid target file "${file}": absolute paths are not allowed`);
+      }
+      if (file.includes("..")) {
+        throw new Error(`Invalid target file "${file}": path traversal (..) is not allowed`);
+      }
+      if (file.startsWith(".multiagent") || file.startsWith(".multiagent/")) {
+        throw new Error(`Invalid target file "${file}": cannot target LAOL system directory`);
+      }
+    }
+  }
+
+  /**
    * Create a new task and write it atomically to tasks/task_{uuid}.json.
    */
   createTask(params: {
@@ -29,9 +47,24 @@ export class TaskStore {
     target_files: string[];
     dependency?: string | null;
   }): Task {
+    // Validate target files before creating task
+    TaskStore.validateTargetFiles(params.target_files);
+
     const now = Date.now();
+    const taskId = uuidv4();
+
+    // Check for self-dependency (can happen with manually constructed JSON)
+    if (params.dependency === taskId) {
+      throw new Error("A task cannot depend on itself");
+    }
+
+    // Check for dependency cycles in existing tasks
+    if (params.dependency) {
+      this.checkDependencyCycle(params.dependency);
+    }
+
     const task: Task = {
-      id: uuidv4(),
+      id: taskId,
       status: "pending",
       description: params.description,
       target_files: params.target_files,
@@ -139,6 +172,37 @@ export class TaskStore {
     if (!fs.existsSync(filePath)) return false;
     fs.unlinkSync(filePath);
     return true;
+  }
+
+  /**
+   * Find all tasks that depend on the given task ID.
+   */
+  findDependents(taskId: string): Task[] {
+    return this.listTasks().filter((t) => t.dependency === taskId);
+  }
+
+  /**
+   * Walk the dependency chain upward from a task to detect cycles.
+   * Throws if a cycle is detected or the chain exceeds a safe depth.
+   */
+  private checkDependencyCycle(startDepId: string): void {
+    const visited = new Set<string>();
+    let current = startDepId;
+    const maxDepth = 20;
+
+    for (let depth = 0; depth < maxDepth; depth++) {
+      if (visited.has(current)) {
+        throw new Error(
+          `Dependency cycle detected: task "${current}" appears twice in the dependency chain`
+        );
+      }
+      visited.add(current);
+
+      const depTask = this.getTask(current);
+      if (!depTask || !depTask.dependency) break;
+
+      current = depTask.dependency;
+    }
   }
 
   /**

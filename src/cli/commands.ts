@@ -81,6 +81,14 @@ taskCmd
 
     const targetFiles: string[] = options.files ?? [];
 
+    // Validate early before creating task
+    try {
+      TaskStore.validateTargetFiles(targetFiles);
+    } catch (err) {
+      console.log(chalk.red((err as Error).message));
+      process.exit(1);
+    }
+
     const task = store.createTask({
       description: options.description,
       target_files: targetFiles,
@@ -144,7 +152,7 @@ taskCmd
 
 taskCmd
   .command("cancel")
-  .description("Cancel a pending task")
+  .description("Cancel a pending or in-progress task")
   .argument("<task-id>", "Task ID")
   .action((taskId: string) => {
     const root = resolveRepoRoot();
@@ -156,19 +164,44 @@ taskCmd
       return;
     }
 
-    if (task.status !== "pending") {
-      console.log(chalk.yellow(`Cannot cancel task with status "${task.status}".`));
+    if (task.status === "done") {
+      console.log(chalk.yellow(`Task already done, nothing to cancel.`));
       return;
+    }
+
+    if (task.status === "failed" || task.status === "stuck") {
+      console.log(chalk.yellow(`Task is already in terminal state "${task.status}".`));
+      return;
+    }
+
+    if (task.status === "in_progress") {
+      console.log(chalk.yellow(`Task is in progress — cancelling (agent will detect on next status check).`));
     }
 
     const updated = store.updateTask(taskId, () => ({
       status: "failed",
-      metadata: { cancelled: true },
+      metadata: { cancelled: true, cancelled_at: Date.now() },
     }));
-    if (updated) {
-      console.log(chalk.green(`Task ${taskId} cancelled.`));
-    } else {
+    if (!updated) {
       console.log(chalk.red("Failed to update task (version conflict)."));
+      return;
+    }
+
+    console.log(chalk.green(`Task ${taskId.slice(0, 8)} cancelled.`));
+
+    // Cascade cancellation to dependent tasks
+    const dependents = store.findDependents(taskId);
+    for (const dep of dependents) {
+      if (dep.status === "pending") {
+        store.updateTask(dep.id, () => ({
+          status: "failed",
+          metadata: {
+            failure_reason: `Dependency task ${taskId.slice(0, 8)} was cancelled`,
+            cancelled: true,
+          },
+        }));
+        console.log(chalk.yellow(`  Cascaded: task ${dep.id.slice(0, 8)} cancelled (depended on ${taskId.slice(0, 8)})`));
+      }
     }
   });
 

@@ -33,7 +33,7 @@ export class LockManager {
    * If any acquire fails, ALL previously acquired locks in this batch
    * are rolled back, guaranteeing no partial lock sets.
    */
-  acquire(taskId: string, agentId: string, targetFiles: string[]): AcquireResult {
+  acquire(taskId: string, agentId: string, targetFiles: string[], ttlMs = 60_000): AcquireResult {
     const now = Date.now();
 
     // Deduplicate files
@@ -75,7 +75,7 @@ export class LockManager {
         file,
         holder: agentId,
         task_id: taskId,
-        expires_at: now + 60000,
+        expires_at: now + ttlMs,
         phase: "initial",
         last_heartbeat: now,
         renew_count: 0,
