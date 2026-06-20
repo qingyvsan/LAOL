@@ -463,6 +463,7 @@ mergeCmd
     const primaryProvider = new ClaudeLLMProvider({
       model: config.llm.model,
       timeoutMs: 60_000,
+      binaryPath: config.claude_executor.binary_path,
     });
 
     let quorumProvider; // ClaudeLLMProvider | undefined
@@ -470,6 +471,7 @@ mergeCmd
       quorumProvider = new ClaudeLLMProvider({
         model: config.llm.secondary_model,
         timeoutMs: 60_000,
+        binaryPath: config.claude_executor.binary_path,
       });
       console.log(chalk.dim(`  Quorum mode enabled (secondary model: ${config.llm.secondary_model})`));
     }

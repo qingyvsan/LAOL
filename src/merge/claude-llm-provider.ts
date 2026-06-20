@@ -1,7 +1,19 @@
 import { execSync } from "node:child_process";
 import type { LLMProvider } from "./llm-merge";
 
-const SHELL = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : "/bin/sh";
+const WIN32 = process.platform === "win32";
+const SHELL = WIN32 ? process.env.ComSpec ?? "cmd.exe" : "/bin/sh";
+
+/**
+ * Resolve the Claude CLI binary name for use in shell commands.
+ * On Windows, the binary is `claude.cmd`; everywhere else it's `claude`.
+ */
+function resolveBinaryName(binaryPath: string): string {
+  if (!WIN32) return binaryPath;
+  // If the path already ends with .cmd/.bat, use it as-is
+  if (/\.(cmd|bat)$/i.test(binaryPath)) return binaryPath;
+  return binaryPath + ".cmd";
+}
 
 /**
  * ClaudeLLMProvider — calls `claude -p` for LLM semantic merge.
@@ -13,26 +25,26 @@ const SHELL = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : 
 export class ClaudeLLMProvider implements LLMProvider {
   private model: string;
   private timeoutMs: number;
+  private binary: string;
 
-  constructor(params?: { model?: string; timeoutMs?: number }) {
+  constructor(params?: { model?: string; timeoutMs?: number; binaryPath?: string }) {
     this.model = params?.model ?? "claude-sonnet-4-6";
     this.timeoutMs = params?.timeoutMs ?? 60_000;
+    this.binary = resolveBinaryName(params?.binaryPath ?? "claude");
   }
 
   async call(prompt: string): Promise<string> {
     try {
-      return execSync(
-        `claude -p --model "${this.model}" --output-format text --no-show-model-card`,
-        {
-          input: prompt,
-          stdio: "pipe",
-          timeout: this.timeoutMs,
-          maxBuffer: 100 * 1024, // 100 KB
-          shell: SHELL,
-          encoding: "utf-8",
-          env: { ...process.env, NO_COLOR: "1" },
-        }
-      ).trim();
+      const cmd = `${this.binary} -p --model "${this.model}" --output-format text --no-show-model-card`;
+      return execSync(cmd, {
+        input: prompt,
+        stdio: "pipe",
+        timeout: this.timeoutMs,
+        maxBuffer: 100 * 1024, // 100 KB
+        shell: SHELL,
+        encoding: "utf-8",
+        env: { ...process.env, NO_COLOR: "1" },
+      }).trim();
     } catch (err: unknown) {
       // If the subprocess fails, return the marker so the merge pipeline
       // treats it as unresolvable and surfaces it for human intervention.
@@ -42,7 +54,7 @@ export class ClaudeLLMProvider implements LLMProvider {
           ? maybeExecErr.stderr
           : "";
       if (stderr) {
-        console.error(`[ClaudeLLMProvider] claude -p failed: ${stderr.slice(0, 500)}`);
+        console.error(`[ClaudeLLMProvider] ${this.binary} -p failed: ${stderr.slice(0, 500)}`);
       }
       return "<<<UNRESOLVABLE>>>";
     }

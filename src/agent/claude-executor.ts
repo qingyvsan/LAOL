@@ -1,4 +1,4 @@
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import type { Task, LaolConfig } from "../data/models";
@@ -30,6 +30,80 @@ function resolveClaudeBinary(binaryPath: string): string {
   }
   // Fallback: return as-is and let the spawn error handler surface the issue
   return binaryPath;
+}
+
+/**
+ * Quote a single argument for a cmd.exe command string.
+ * Wraps in double-quotes if it contains spaces or double-quote characters.
+ */
+function quoteCmdArg(arg: string): string {
+  if (/[\s"]/.test(arg)) {
+    return `"${arg.replace(/"/g, '\\"')}"`;
+  }
+  return arg;
+}
+
+/**
+ * Spawn the Claude binary as a child process.
+ *
+ * On Windows with Node.js v22+, .cmd/.bat files cannot be spawned directly
+ * via spawn() — they fail with EINVAL. We work around this by launching
+ * cmd.exe /d /s /c with the full command string, which Node.js itself uses
+ * internally for .cmd resolution in older versions.
+ *
+ * The prompt is piped via stdin rather than passed as a -p argument,
+ * which avoids any risk of Windows command-line escaping corrupting
+ * backslash sequences in file paths.
+ */
+function spawnBinary(
+  binary: string,
+  args: string[],
+  options: SpawnOptions
+): ChildProcess {
+  if (!WIN32) {
+    return spawn(binary, args, options);
+  }
+
+  // Build a command string and launch via cmd.exe.
+  // Individual args that contain spaces or quotes are wrapped in
+  // double-quotes to survive cmd.exe parsing.
+  const parts = [quoteCmdArg(binary), ...args.map(quoteCmdArg)];
+  const cmdStr = parts.join(" ");
+
+  return spawn("cmd.exe", ["/d", "/s", "/c", cmdStr], options);
+}
+
+/**
+ * Kill a process and its entire subtree.
+ *
+ * On Windows, POSIX signals do not exist — child.kill("SIGTERM") is
+ * equivalent to a forced kill and does NOT kill children of the process.
+ * Since spawnBinary launches cmd.exe (which spawns the actual Claude
+ * process), we must use taskkill /T to clean up the whole tree.
+ *
+ * On Unix, SIGTERM followed by SIGKILL works as expected for process
+ * trees that share a process group.
+ */
+function killProcessTree(pid: number | undefined, signal: "SIGTERM" | "SIGKILL" = "SIGTERM"): boolean {
+  if (pid === undefined) return false;
+
+  if (WIN32) {
+    // /T = tree kill, /F = force
+    try {
+      execSync(`taskkill /PID ${pid} /T /F`, { stdio: "pipe", timeout: 5000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Unix: send signal to the process group
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -94,7 +168,7 @@ export class ClaudeCodeExecutor {
     const startTime = Date.now();
     const discoveryPrompt = this.buildDiscoveryPrompt(worktreePath, task);
 
-    const child = spawn(this.resolvedBinary, [
+    const child = spawnBinary(this.resolvedBinary, [
       "--output-format", "text",
       "--allowedTools", "Read, Glob, Grep",
       "--effort", "low",
@@ -111,7 +185,7 @@ export class ClaudeCodeExecutor {
     return new Promise((resolve) => {
       let stdout = "";
       const timer = setTimeout(() => {
-        child.kill("SIGTERM");
+        killProcessTree(child.pid);
         resolve({ files: [], durationMs: Date.now() - startTime });
       }, 60000); // 60s timeout for discovery
 
@@ -190,7 +264,7 @@ export class ClaudeCodeExecutor {
       let timedOut = false;
       let settled = false;
 
-      const child: ChildProcess = spawn(this.resolvedBinary, args, {
+      const child: ChildProcess = spawnBinary(this.resolvedBinary, args, {
         cwd: worktreePath,
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
@@ -204,11 +278,11 @@ export class ClaudeCodeExecutor {
         timedOut = true;
         if (!settled) {
           settled = true;
-          child.kill("SIGTERM");
+          killProcessTree(child.pid, "SIGTERM");
           // Give it 5 seconds to gracefully exit, then force kill
           setTimeout(() => {
             if (child.exitCode === null) {
-              child.kill("SIGKILL");
+              killProcessTree(child.pid, "SIGKILL");
             }
           }, 5000);
         }
@@ -416,11 +490,17 @@ export class ClaudeCodeExecutor {
 
   private binaryExists(): boolean {
     try {
-      execSync(`"${this.resolvedBinary}" --version`, {
+      // Use the same spawn path as execution (spawnBinary) to ensure
+      // the binary is found and invocable. On Windows this goes through
+      // cmd.exe, matching the actual execution path.
+      const child = spawnBinary(this.resolvedBinary, ["--version"], {
         stdio: "pipe",
         timeout: 5000,
       });
-      return true;
+      // Synchronous check: kill immediately after verifying it starts
+      const ok = child.pid !== undefined;
+      killProcessTree(child.pid);
+      return ok;
     } catch {
       return false;
     }

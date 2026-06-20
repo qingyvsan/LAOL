@@ -207,12 +207,16 @@ export class WorktreePool {
 
   private cleanWorktree(wtPath: string): void {
     try {
-      // Delete any agent branches in this worktree
-      execSync(`git checkout --detach HEAD 2>/dev/null || true`, {
-        cwd: wtPath,
-        stdio: "pipe",
-        timeout: 10_000,
-      });
+      // Detach HEAD (ignore errors — the worktree may already be detached)
+      try {
+        execSync(`git checkout --detach HEAD`, {
+          cwd: wtPath,
+          stdio: "pipe",
+          timeout: 10_000,
+        });
+      } catch {
+        // Already detached or no commits yet — fine
+      }
 
       execSync(`git reset --hard HEAD`, {
         cwd: wtPath,
