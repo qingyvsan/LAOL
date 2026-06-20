@@ -40,6 +40,7 @@ program
       ".multiagent/wal",
       ".multiagent/warnings",
       ".multiagent/worktrees",
+      ".multiagent/reports",
     ];
 
     for (const dir of dirs) {
@@ -75,6 +76,7 @@ taskCmd
   .requiredOption("--description <text>", "Task description")
   .option("--files <paths...>", "Target file paths (optional — agent will discover if not specified)")
   .option("--dependency <task-id>", "Task ID this task depends on")
+  .option("--read-only", "Mark task as read-only (analysis/report, no file modifications)")
   .action((options) => {
     const root = resolveRepoRoot();
     const store = new TaskStore(root);
@@ -93,10 +95,12 @@ taskCmd
       description: options.description,
       target_files: targetFiles,
       dependency: options.dependency ?? null,
+      metadata: options.readOnly ? { read_only: true } : undefined,
     });
 
     console.log(chalk.green(`Task created: ${task.id}`));
     console.log(`  Status: ${chalk.yellow(task.status)}`);
+    console.log(`  Type:   ${options.readOnly ? chalk.blue("read-only (analysis)") : chalk.dim("modification")}`);
     if (task.target_files.length > 0) {
       console.log(`  Files: ${task.target_files.join(", ")}`);
     } else {
@@ -138,6 +142,8 @@ taskCmd
     console.log(chalk.bold("\nTask Details:"));
     console.log(`  ID:          ${task.id}`);
     console.log(`  Status:      ${task.status}`);
+    const isReadOnly = task.metadata?.read_only === true;
+    console.log(`  Type:        ${isReadOnly ? chalk.blue("read-only (analysis)") : chalk.dim("modification")}`);
     console.log(`  Description: ${task.description}`);
     console.log(`  Files:       ${task.target_files.join(", ")}`);
     console.log(`  Agent:       ${task.assigned_agent ?? "(unassigned)"}`);
@@ -147,6 +153,16 @@ taskCmd
     console.log(`  Version:     ${task.version}`);
     if (Object.keys(task.metadata).length > 0) {
       console.log(`  Metadata:    ${JSON.stringify(task.metadata, null, 2)}`);
+    }
+
+    // Display report for read-only tasks
+    const reportPath = path.join(root, ".multiagent", "reports", `${taskId}.md`);
+    if (fs.existsSync(reportPath)) {
+      console.log(chalk.bold("\n--- Report ---"));
+      const report = fs.readFileSync(reportPath, "utf-8");
+      console.log(report);
+    } else if (isReadOnly && task.status === "done") {
+      console.log(chalk.yellow("\n  (Report file not found — the agent may not have saved output)"));
     }
   });
 

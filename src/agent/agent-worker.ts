@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { TaskStore } from "../task/task-store";
@@ -92,14 +93,14 @@ export class AgentWorker {
    * or another LLM tool).
    *
    * @param task - The task to execute
-   * @param executor - Callback that performs the actual AI code modifications.
-   *   Receives the worktree path and should return void or throw on failure.
+   * @param executor - Callback that performs the actual AI work.
+   *   Receives the worktree path and returns stdout for report saving.
    * @param discoveryExecutor - Optional callback for file discovery when
    *   target_files is empty. Returns discovered file paths.
    */
   async executeTask(
     task: Task,
-    executor: (worktreePath: string, task: Task, contextHints: string[]) => Promise<void>,
+    executor: (worktreePath: string, task: Task, contextHints: string[]) => Promise<{ stdout: string }>,
     discoveryExecutor?: (worktreePath: string, task: Task) => Promise<string[]>
   ): Promise<void> {
     this.currentTask = task;
@@ -123,7 +124,13 @@ export class AgentWorker {
         this.config.agent.checkpoint_min_interval_ms
       );
 
-      // 4. Discovery phase — if target_files is empty, discover files first
+      // 4. Read-only path — analysis/report tasks that don't modify files
+      if (task.metadata?.read_only) {
+        await this.executeReadOnlyTask(task, handle.path, executor);
+        return;
+      }
+
+      // 6. Discovery phase — if target_files is empty, discover files first
       if (task.target_files.length === 0 && discoveryExecutor) {
         console.log(`[agent ${this.agentId}] Entering discovery phase for task ${taskId.slice(0, 8)}...`);
         const discoveredFiles = await discoveryExecutor(handle.path, task);
@@ -154,15 +161,15 @@ export class AgentWorker {
         this.activeLockFiles = task.target_files.map((f) => f); // copy
       }
 
-      // 5. Start heartbeat (now that we have locks)
+      // 7. Start heartbeat (now that we have locks)
       this.heartbeat.start(() => this.activeLockFiles);
 
-      // 6. Start perception
+      // 8. Start perception
       this.perception = new Perception(this.repoRoot, taskId,
         this.activeLockFiles.length > 0 ? this.activeLockFiles : task.target_files);
       this.perception.start();
 
-      // 7. Collect context hints
+      // 9. Collect context hints
       const contextHints: string[] = [];
 
       // Check warnings
@@ -177,7 +184,7 @@ export class AgentWorker {
         contextHints.push(ctxSummary);
       }
 
-      // 8. Pre-work checkpoint
+      // 10. Pre-work checkpoint
       try {
         const result = this.checkpoint.checkAndRebase();
         if (result.updated && result.message) {
@@ -191,17 +198,17 @@ export class AgentWorker {
         throw err;
       }
 
-      // 9. Execute the actual AI work
+      // 11. Execute the actual AI work
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
       await executor(handle.path, task, contextHints);
 
-      // 10. Commit changes
+      // 12. Commit changes
       this.commitChanges(handle.path, task);
 
-      // 11. Push branch
+      // 13. Push branch
       this.pushBranch(handle.path, task);
 
-      // 12. Update registry for modified files
+      // 14. Update registry for modified files
       for (const file of this.activeLockFiles) {
         this.registryManager.updateEntry(
           file,
@@ -210,7 +217,7 @@ export class AgentWorker {
         );
       }
 
-      // 13. Complete task
+      // 15. Complete task
       this.completeTask(taskId);
 
     } catch (err) {
@@ -311,6 +318,74 @@ export class AgentWorker {
     // Notify scheduler
     this.socketClient.notifyTaskDone(taskId);
     console.log(`[agent ${this.agentId}] Task ${taskId.slice(0, 8)} DONE`);
+  }
+
+  /**
+   * Execute a read-only analysis/report task.
+   *
+   * Skips locks, heartbeat, perception, commit, push, and registry update.
+   * Saves Claude Code stdout to .multiagent/reports/{taskId}.md for later
+   * retrieval by the user via `laol task show <id>`.
+   */
+  private async executeReadOnlyTask(
+    task: Task,
+    worktreePath: string,
+    executor: (worktreePath: string, task: Task, contextHints: string[]) => Promise<{ stdout: string }>
+  ): Promise<void> {
+    const taskId = task.id;
+
+    console.log(`[agent ${this.agentId}] Read-only task ${taskId.slice(0, 8)} — analysis/report mode`);
+
+    // Collect context hints (without perception, since no file modifications)
+    const contextHints: string[] = [
+      "[MODE] This is a READ-ONLY analysis task. Do NOT modify any files. " +
+      "Explore the codebase, analyze, and report your findings. " +
+      "Your entire response will be saved and shown to the user as a report.",
+    ];
+
+    // Pre-work checkpoint (rebase to get latest code for analysis)
+    try {
+      const result = this.checkpoint!.checkAndRebase();
+      if (result.updated && result.message) {
+        contextHints.push(`[CHECKPOINT] ${result.message}`);
+      }
+    } catch (err) {
+      if (err instanceof RebaseConflictError) {
+        this.failTask(taskId, err.message);
+        return;
+      }
+      throw err;
+    }
+
+    // Execute the AI analysis
+    console.log(`[agent ${this.agentId}] Starting read-only analysis for task ${taskId.slice(0, 8)}`);
+    const { stdout } = await executor(worktreePath, task, contextHints);
+
+    // Save the report
+    this.saveReport(taskId, stdout);
+
+    // Complete with read_only metadata
+    this.taskStore.updateTask(taskId, () => ({
+      status: "done",
+      updated_at: Date.now(),
+      metadata: { read_only: true },
+    }));
+
+    this.socketClient.notifyTaskDone(taskId);
+    console.log(`[agent ${this.agentId}] Task ${taskId.slice(0, 8)} DONE (read-only)`);
+  }
+
+  /**
+   * Save Claude Code stdout as a markdown report.
+   */
+  private saveReport(taskId: string, stdout: string): void {
+    const reportsDir = path.join(this.repoRoot, ".multiagent", "reports");
+    if (!fs.existsSync(reportsDir)) {
+      fs.mkdirSync(reportsDir, { recursive: true });
+    }
+    const reportPath = path.join(reportsDir, `${taskId}.md`);
+    fs.writeFileSync(reportPath, stdout, "utf-8");
+    console.log(`[agent ${this.agentId}] Report saved: .multiagent/reports/${taskId}.md`);
   }
 
   /**

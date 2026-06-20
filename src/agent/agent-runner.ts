@@ -227,6 +227,8 @@ export class AgentRunner {
         task,
         // Main executor: spawn Claude Code for the actual work
         async (worktreePath, _task, contextHints) => {
+          const isReadOnly = _task.metadata?.read_only === true;
+
           // Print context hints
           if (knowledgeContext) {
             console.log(chalk.magenta(`[knowledge] ${knowledgeContext}`));
@@ -240,7 +242,8 @@ export class AgentRunner {
             ? _task.target_files.join(", ")
             : "(auto-discovered)";
 
-          console.log(chalk.cyan(`\n=== Agent Starting Work ===`));
+          const modeLabel = isReadOnly ? "Analysis (read-only)" : "Starting Work";
+          console.log(chalk.cyan(`\n=== Agent ${modeLabel} ===`));
           console.log(chalk.cyan(`Worktree: ${worktreePath}`));
           console.log(chalk.cyan(`Task:     ${_task.description}`));
           console.log(chalk.cyan(`Files:    ${filesStr}\n`));
@@ -250,21 +253,24 @@ export class AgentRunner {
             worktreePath,
             _task,
             contextHints,
-            (chunk) => process.stdout.write(chalk.dim(chunk))
+            (chunk) => process.stdout.write(chalk.dim(chunk)),
+            isReadOnly
           );
 
           console.log(chalk.dim(`\n[claude] Duration: ${(result.durationMs / 1000).toFixed(1)}s`));
           console.log(chalk.dim(`[claude] Exit code: ${result.exitCode}`));
 
-          // Save knowledge for future agents
-          this.knowledgeStore.save({
-            task_id: _task.id,
-            agent_id: this.agentId,
-            description: _task.description,
-            summary: result.stdout.slice(0, 500) || _task.description,
-            files: _task.target_files,
-            created_at: Date.now(),
-          });
+          // Save knowledge for future agents (skip for read-only — full output saved as report)
+          if (!isReadOnly) {
+            this.knowledgeStore.save({
+              task_id: _task.id,
+              agent_id: this.agentId,
+              description: _task.description,
+              summary: result.stdout.slice(0, 500) || _task.description,
+              files: _task.target_files,
+              created_at: Date.now(),
+            });
+          }
 
           if (!result.success) {
             if (result.timedOut) {
@@ -277,7 +283,13 @@ export class AgentRunner {
             );
           }
 
-          console.log(chalk.green(`[claude] Task completed successfully`));
+          if (isReadOnly) {
+            console.log(chalk.blue(`[claude] Analysis completed`));
+          } else {
+            console.log(chalk.green(`[claude] Task completed successfully`));
+          }
+
+          return { stdout: result.stdout };
         },
         // Discovery executor: spawn Claude Code to discover target files
         async (worktreePath, _task) => {

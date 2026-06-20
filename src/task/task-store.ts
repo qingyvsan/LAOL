@@ -46,6 +46,7 @@ export class TaskStore {
     description: string;
     target_files: string[];
     dependency?: string | null;
+    metadata?: Record<string, unknown>;
   }): Task {
     // Validate target files before creating task
     TaskStore.validateTargetFiles(params.target_files);
@@ -72,7 +73,7 @@ export class TaskStore {
       created_at: now,
       updated_at: now,
       dependency: params.dependency ?? null,
-      metadata: {},
+      metadata: params.metadata ?? {},
       version: 1,
     };
 

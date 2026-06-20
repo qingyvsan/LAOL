@@ -228,11 +228,12 @@ export class ClaudeCodeExecutor {
     worktreePath: string,
     task: Task,
     contextHints: string[],
-    onOutput?: (chunk: string) => void
+    onOutput?: (chunk: string) => void,
+    readOnly = false
   ): Promise<ClaudeExecutionResult> {
     const startTime = Date.now();
-    const prompt = this.buildPrompt(worktreePath, task, contextHints);
-    const args = this.buildArgs();
+    const prompt = this.buildPrompt(worktreePath, task, contextHints, readOnly);
+    const args = this.buildArgs(readOnly);
 
     // Verify binary exists (fail fast with clear message)
     if (!this.binaryExists()) {
@@ -390,21 +391,33 @@ export class ClaudeCodeExecutor {
   private buildPrompt(
     worktreePath: string,
     task: Task,
-    contextHints: string[]
+    contextHints: string[],
+    readOnly = false
   ): string {
     const lines: string[] = [];
 
-    lines.push("You are an AI coding agent in the LAOL multi-agent collaboration system.");
-    lines.push("You are working in an isolated git worktree. Your changes will be");
-    lines.push("committed and merged automatically after you finish.");
+    if (readOnly) {
+      lines.push("You are an AI analysis agent in the LAOL multi-agent collaboration system.");
+      lines.push("You are working in an isolated git worktree. This is a READ-ONLY task —");
+      lines.push("you must NOT modify any files. Your entire response will be saved as a");
+      lines.push("report and shown directly to the user.");
+    } else {
+      lines.push("You are an AI coding agent in the LAOL multi-agent collaboration system.");
+      lines.push("You are working in an isolated git worktree. Your changes will be");
+      lines.push("committed and merged automatically after you finish.");
+    }
     lines.push("");
     lines.push("## Task");
     lines.push(task.description);
     lines.push("");
 
     if (task.target_files.length > 0) {
-      lines.push("## Target Files");
-      lines.push("Focus your changes on these files:");
+      if (readOnly) {
+        lines.push("## Target Files (for analysis)");
+      } else {
+        lines.push("## Target Files");
+        lines.push("Focus your changes on these files:");
+      }
       for (const f of task.target_files) {
         lines.push(`- ${f}`);
       }
@@ -426,29 +439,40 @@ export class ClaudeCodeExecutor {
     }
 
     lines.push("## Instructions");
-    lines.push("1. Read the target files to understand the current code");
-    lines.push("2. Implement the changes described in the Task section");
-    lines.push("3. Verify your changes compile and are correct");
-    lines.push("4. Keep changes minimal and focused — only modify what the task requires");
+    if (readOnly) {
+      lines.push("1. Read and explore the relevant files to understand the code");
+      lines.push("2. Analyze based on the task description");
+      lines.push("3. Report your findings clearly and comprehensively");
+      lines.push("4. Do NOT modify any files — this is a read-only analysis");
+      lines.push("5. Structure your response as a clear, well-organized report");
+      lines.push("   since it will be shown directly to the user");
+    } else {
+      lines.push("1. Read the target files to understand the current code");
+      lines.push("2. Implement the changes described in the Task section");
+      lines.push("3. Verify your changes compile and are correct");
+      lines.push("4. Keep changes minimal and focused — only modify what the task requires");
+    }
     lines.push("");
 
     // If there are test commands in the project, hint at running them
-    const pkgJsonPath = path.join(worktreePath, "package.json");
-    if (fs.existsSync(pkgJsonPath)) {
-      try {
-        const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
-        if (pkg.scripts?.test) {
-          lines.push("Run tests to verify your changes:");
-          lines.push(`  npm test`);
-          lines.push("");
+    if (!readOnly) {
+      const pkgJsonPath = path.join(worktreePath, "package.json");
+      if (fs.existsSync(pkgJsonPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
+          if (pkg.scripts?.test) {
+            lines.push("Run tests to verify your changes:");
+            lines.push(`  npm test`);
+            lines.push("");
+          }
+          if (pkg.scripts?.build) {
+            lines.push("Verify the build passes:");
+            lines.push(`  npm run build`);
+            lines.push("");
+          }
+        } catch {
+          // ignore — package.json may be malformed
         }
-        if (pkg.scripts?.build) {
-          lines.push("Verify the build passes:");
-          lines.push(`  npm run build`);
-          lines.push("");
-        }
-      } catch {
-        // ignore — package.json may be malformed
       }
     }
 
@@ -457,7 +481,7 @@ export class ClaudeCodeExecutor {
 
   // ---- CLI argument building ----
 
-  private buildArgs(): string[] {
+  private buildArgs(readOnly = false): string[] {
     const args: string[] = [];
 
     // Prompt is piped via stdin (not passed as -p argument) to avoid
@@ -467,8 +491,10 @@ export class ClaudeCodeExecutor {
     // Output format — text is simpler to capture
     args.push("--output-format", "text");
 
-    // Restrict tools to safe code-editing set
-    if (this.allowedTools.length > 0) {
+    // Restrict tools: read-only tasks only get exploration tools
+    if (readOnly) {
+      args.push("--allowedTools", "Read, Glob, Grep");
+    } else if (this.allowedTools.length > 0) {
       args.push("--allowedTools", this.allowedTools.join(", "));
     }
 
