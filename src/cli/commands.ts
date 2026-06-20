@@ -54,7 +54,7 @@ program
     console.log(chalk.green("  created: .multiagent/config.json"));
 
     const gitignorePath = path.join(multiagentDir, ".gitignore");
-    fs.writeFileSync(gitignorePath, "worktrees/\nwal/\nstaging/\n", "utf-8");
+    fs.writeFileSync(gitignorePath, "worktrees/\nwal/\nstaging/\ntasks/\nlocks/\n", "utf-8");
     console.log(chalk.green("  created: .multiagent/.gitignore"));
 
     console.log(chalk.bold("\nLAOL initialized successfully."));

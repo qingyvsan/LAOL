@@ -1,3 +1,5 @@
 worktrees/
 wal/
 staging/
+tasks/
+locks/
