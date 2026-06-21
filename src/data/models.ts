@@ -189,7 +189,7 @@ export interface ImportInfo {
 
 export interface SymbolDef {
   name: string;
-  kind: "function" | "class" | "const" | "let" | "var" | "export" | "interface" | "type";
+  kind: "function" | "class" | "const" | "let" | "var" | "export" | "interface" | "type" | "module" | "decorator";
   range: [number, number]; // line range
   exported: boolean;
   // Rich metadata (optional — backward compatible with SymbolResolver)

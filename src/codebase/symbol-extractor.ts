@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import ts from "typescript";
+import { PythonSymbolExtractor } from "./python-extractor";
 import type { SymbolDef, JsDocInfo, ParamInfo, CallInfo, ImportInfo } from "../data/models";
 
 /**
@@ -31,6 +32,13 @@ export class SymbolExtractor {
     if (!fs.existsSync(filePath)) return null;
 
     const ext = path.extname(filePath).toLowerCase();
+
+    // Dispatch Python files to PythonSymbolExtractor
+    if (ext === ".py") {
+      const pyExtractor = new PythonSymbolExtractor();
+      return pyExtractor.extract(filePath);
+    }
+
     if (!SymbolExtractor.TS_EXTS.has(ext) && !SymbolExtractor.JS_EXTS.has(ext)) {
       return null;
     }

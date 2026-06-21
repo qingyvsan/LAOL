@@ -139,7 +139,7 @@ export const ImportInfoSchema = z.object({
 
 export const SymbolDefSchema = z.object({
   name: z.string(),
-  kind: z.enum(["function", "class", "const", "let", "var", "export", "interface", "type"]),
+  kind: z.enum(["function", "class", "const", "let", "var", "export", "interface", "type", "module", "decorator"]),
   range: z.tuple([z.number().int().positive(), z.number().int().positive()]),
   exported: z.boolean(),
   jsDoc: JsDocInfoSchema.optional(),
@@ -165,7 +165,7 @@ export const CodebaseIndexSchema = z.record(z.string(), IndexedFileSchema);
 // --- Codebase Indexer Config ---
 
 export const CodebaseIndexerConfigSchema = z.object({
-  include: z.array(z.string()).default(["src/**/*.ts", "src/**/*.tsx"]),
+  include: z.array(z.string()).default(["src/**/*.ts", "src/**/*.tsx", "src/**/*.py"]),
   exclude: z.array(z.string()).default([
     "**/node_modules/**",
     "**/dist/**",
@@ -176,6 +176,10 @@ export const CodebaseIndexerConfigSchema = z.object({
     "**/*.test.tsx",
     "**/*.spec.ts",
     "**/*.spec.tsx",
+    "**/*.test.py",
+    "**/*.spec.py",
+    "**/test_*.py",
+    "**/*_test.py",
   ]),
   auto_index: z.boolean().default(true),
   index_interval_ms: z.number().int().min(1000).default(60000),

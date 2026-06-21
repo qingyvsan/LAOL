@@ -234,7 +234,7 @@ export class CodebaseIndexer {
         byKind.set(sym.kind, list);
       }
 
-      const kindOrder = ["class", "function", "interface", "type", "const", "let", "var", "export"];
+      const kindOrder = ["class", "function", "interface", "type", "const", "let", "var", "export", "module", "decorator"];
       for (const kind of kindOrder) {
         const syms = byKind.get(kind);
         if (!syms || syms.length === 0) continue;

@@ -45,7 +45,7 @@ export const DEFAULT_CONFIG: LaolConfig = {
     skip_permissions: true,
   },
   codebase_indexer: {
-    include: ["src/**/*.ts", "src/**/*.tsx"],
+    include: ["src/**/*.ts", "src/**/*.tsx", "src/**/*.py"],
     exclude: [
       "**/node_modules/**",
       "**/dist/**",
@@ -56,6 +56,10 @@ export const DEFAULT_CONFIG: LaolConfig = {
       "**/*.test.tsx",
       "**/*.spec.ts",
       "**/*.spec.tsx",
+      "**/*.test.py",
+      "**/*.spec.py",
+      "**/test_*.py",
+      "**/*_test.py",
     ],
     auto_index: true,
     index_interval_ms: 60000,

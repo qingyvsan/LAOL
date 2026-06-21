@@ -407,3 +407,79 @@ describe("CodebaseIndexer — persistence", () => {
     expect(entry!.symbols[0].name).toBe("VERSION");
   });
 });
+
+describe("CodebaseIndexer — Python support", () => {
+  let tmpDir: string;
+  let indexer: CodebaseIndexer;
+
+  const pyConfig: LaolConfig["codebase_indexer"] = {
+    include: ["src/**/*.ts", "src/**/*.py"],
+    exclude: ["**/node_modules/**", "**/dist/**", "**/__tests__/**",
+      "**/*.test.ts", "**/*.spec.ts", "**/*.test.py", "**/test_*.py", "**/*_test.py"],
+    auto_index: false,
+    index_interval_ms: 60000,
+  };
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "laol-pyidx-"));
+    fs.mkdirSync(path.join(tmpDir, "src"));
+    fs.mkdirSync(path.join(tmpDir, ".multiagent"));
+    indexer = new CodebaseIndexer(tmpDir, pyConfig);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("indexes Python files alongside TypeScript files", () => {
+    fs.writeFileSync(path.join(tmpDir, "src", "data.ts"), [
+      "export const VERSION = '1.0';",
+    ].join("\n"), "utf-8");
+
+    fs.writeFileSync(path.join(tmpDir, "src", "utils.py"), [
+      "def helper() -> str:",
+      '    """A utility function."""',
+      '    return "ok"',
+    ].join("\n"), "utf-8");
+
+    const stats = indexer.build(true);
+    expect(stats.totalFiles).toBe(2);
+    expect(stats.totalSymbols).toBeGreaterThanOrEqual(2); // VERSION + helper + <module>
+    // symbolsByKind should include Python kinds
+    const kinds = Object.keys(stats.symbolsByKind);
+    expect(kinds).toContain("module");
+  });
+
+  it("query finds Python symbols by keyword", () => {
+    fs.writeFileSync(path.join(tmpDir, "src", "auth.py"), [
+      "def authenticate(user: str, password: str) -> bool:",
+      '    """Verify user credentials."""',
+      "    return True",
+    ].join("\n"), "utf-8");
+
+    indexer.build(true);
+    const results = indexer.query("authenticate");
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    const match = results.find((r) => r.symbol.name === "authenticate");
+    expect(match).toBeDefined();
+    expect(match!.symbol.kind).toBe("function");
+    expect(match!.file).toBe("src/auth.py");
+  });
+
+  it("incremental build works for Python files", () => {
+    const fp = path.join(tmpDir, "src", "m.py");
+    fs.writeFileSync(fp, "x = 1\n", "utf-8");
+
+    // First build
+    const s1 = indexer.build(true);
+    expect(s1.totalFiles).toBe(1);
+
+    // Modify file
+    fs.writeFileSync(fp, "x = 1\ny = 2\n", "utf-8");
+
+    // Incremental build — should detect change
+    const s2 = indexer.build(false);
+    expect(s2.totalFiles).toBe(1);
+    expect(s2.totalSymbols).toBeGreaterThan(s1.totalSymbols);
+  });
+});

@@ -54,7 +54,12 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
 
 ## Codebase Indexer
 
-LAOL includes a built-in **symbol-level codebase indexer** that extracts and indexes every function, class, interface, type alias, and variable in your TypeScript project — along with their JSDoc documentation, parameter signatures, return types, imports, and call graphs.
+LAOL includes a built-in **symbol-level codebase indexer** that extracts and indexes every function, class, interface, type alias, and variable in your project — along with their JSDoc/docstring documentation, parameter signatures, return types, imports, and call graphs.
+
+**Supported languages:** TypeScript/JavaScript (`.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs`) and Python (`.py`).
+
+- **TypeScript/JavaScript** — parsed via the TypeScript compiler API. Extracts JSDoc annotations (`@param`, `@returns`, custom tags).
+- **Python** — parsed via Python's built-in `ast` module through a subprocess. Extracts Sphinx-style (`:param`, `:returns`, `:raises`, `:rtype`) and Google-style (`Args:`, `Returns:`) docstrings. Type hints are converted to parameter/return types. Requires Python on `$PATH`; gracefully degrades if not found.
 
 The index powers two key workflows:
 
@@ -346,7 +351,7 @@ AgentRunner.handleTaskAssigned(msg)
 ```bash
 npm install
 npm run build       # TypeScript → dist/
-npm test            # Vitest (231 tests, 18 files)
+npm test            # Vitest (257 tests, 19 files)
 npm run dev         # Watch mode
 ```
 
@@ -366,7 +371,7 @@ src/
 ├── registry/        # Semantic change registry (module export tracking)
 ├── codebase/        # Symbol-level indexer (TS AST extraction, keyword search, API docs)
 ├── cli/             # Commander-based CLI (8 command groups)
-└── __tests__/       # 18 test files, 231 tests
+└── __tests__/       # 19 test files, 257 tests
 ```
 
 ## License
