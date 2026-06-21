@@ -52,6 +52,28 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
                     main branch
 ```
 
+## Codebase Indexer
+
+LAOL includes a built-in **symbol-level codebase indexer** that extracts and indexes every function, class, interface, type alias, and variable in your TypeScript project — along with their JSDoc documentation, parameter signatures, return types, imports, and call graphs.
+
+The index powers two key workflows:
+
+- **Agent task localization** — Before executing a task, agents query the index for relevant symbols and receive auto-injected `[CODEBASE INDEX]` context hints. This helps the LLM understand the codebase structure without reading every file.
+- **API documentation** — Generate comprehensive API docs from JSDoc annotations with a single command.
+
+The index is stored at `.multiagent/codebase-index.json` and supports incremental updates — only re-parses files that have changed since the last build.
+
+### Symbol Extraction Depth
+
+| Extracted | Example |
+|-----------|---------|
+| Symbol name, kind, location | `AuthService` (class), `src/auth.ts:42` |
+| JSDoc description & tags | `@deprecated Use AuthServiceV2 instead` |
+| Parameter names & types | `(username: string, password: string)` |
+| Return type | `Promise<User>` |
+| Import map | `import { User } from "./models"` |
+| Call graph (outgoing) | `AuthService.login` calls `validatePassword`, `createSession` |
+
 ## How It Prevents Conflicts
 
 | Mechanism | What it does |
@@ -63,6 +85,7 @@ LAOL lets multiple Claude Code AI agents safely modify the same codebase **in pa
 | **Graded TTL Leases** | New locks: 60s TTL. After 2 successful renewals: 180s TTL. If an agent crashes, locks auto-expire within 90s (not 300s). |
 | **Semantic Warnings** | When Agent A modifies a module's exports, Agent B gets a context hint before editing that module. |
 | **Agent Circuit Breaker** | 2 consecutive failures → degraded (simple tasks only). 5 → quarantined (no tasks). Prevents broken agents from burning API costs. |
+| **Task Dependency Chains** | When Task B depends on Task A, B's worktree starts from A's branch — inheriting all code changes. Agents receive `[PREDECESSOR]` context hints describing what A did. Chain of any length: A → B → C works naturally. |
 
 ## Key Design Decisions
 
@@ -134,6 +157,11 @@ laol task add --description "Fix all TypeScript errors in the project"
 # Task created: 3f7a9b2c-...
 #   Status: pending
 #   Files: src/auth.ts, src/auth.test.ts  (or "auto-discover")
+
+# Create a follow-up task that continues from the previous one:
+laol task add --description "Add error handling to the login function" \
+              --files "src/auth.ts" \
+              --dependency 3f7a9b2c
 ```
 
 ### 5. Watch it work
@@ -161,7 +189,7 @@ Initialize `.multiagent/` in the current repository.
 
 | Command | Description |
 |---------|-------------|
-| `laol task add --description "..." [--files <paths...>]` | Create a task (files optional — agents auto-discover) |
+| `laol task add --description "..." [--files <paths...>] [--dependency <task-id>] [--read-only]` | Create a task (files optional — agents auto-discover; `--dependency` chains tasks for code inheritance) |
 | `laol task list [--status pending\|done\|failed] [--agent <id>]` | List tasks |
 | `laol task show <task-id>` | Show task details |
 | `laol task cancel <task-id>` | Cancel a pending task |
@@ -191,6 +219,16 @@ Initialize `.multiagent/` in the current repository.
 |---------|-------------|
 | `laol config show` | Display current configuration |
 | `laol config set <key> <value>` | Set a config value (e.g. `scheduler.port 9124`) |
+
+### `laol indexer`
+
+| Command | Description |
+|---------|-------------|
+| `laol indexer build [--full]` | Build or incrementally update the codebase index |
+| `laol indexer query <keyword>` | Search indexed symbols with relevance scoring |
+| `laol indexer show <file>` | Show all indexed symbols in a file |
+| `laol indexer stats` | Show index statistics (files, symbols, kinds) |
+| `laol indexer docs [--output <path>] [--files <glob>]` | Generate API documentation in markdown |
 
 ### `laol status`
 
@@ -308,7 +346,7 @@ AgentRunner.handleTaskAssigned(msg)
 ```bash
 npm install
 npm run build       # TypeScript → dist/
-npm test            # Vitest (197 tests, 16 files)
+npm test            # Vitest (231 tests, 18 files)
 npm run dev         # Watch mode
 ```
 
@@ -326,8 +364,9 @@ src/
 ├── events/          # EventBus (internal) + TCP socket server/client (cross-platform IPC)
 ├── wal/             # Write-ahead log for crash recovery
 ├── registry/        # Semantic change registry (module export tracking)
-├── cli/             # Commander-based CLI (7 command groups)
-└── __tests__/       # 16 test files, 197 tests
+├── codebase/        # Symbol-level indexer (TS AST extraction, keyword search, API docs)
+├── cli/             # Commander-based CLI (8 command groups)
+└── __tests__/       # 18 test files, 231 tests
 ```
 
 ## License

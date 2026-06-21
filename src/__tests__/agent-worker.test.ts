@@ -222,7 +222,7 @@ describe("AgentWorker — lifecycle", () => {
   it("acquires worktree before executor runs", async () => {
     const task = makeTask();
     await worker.executeTask(task, vi.fn().mockResolvedValue(undefined));
-    expect(mocks.worktreePool.acquire).toHaveBeenCalledWith(task.id);
+    expect(mocks.worktreePool.acquire).toHaveBeenCalledWith(task.id, "main");
   });
 
   it("commits and pushes changes on success", async () => {

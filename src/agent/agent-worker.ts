@@ -112,9 +112,10 @@ export class AgentWorker {
         throw new Error(`Task ${taskId} is not in_progress (current: ${task.status})`);
       }
 
-      // 2. Acquire worktree
-      console.log(`[agent ${this.agentId}] Acquiring worktree for task ${taskId.slice(0, 8)}...`);
-      const handle = this.worktreePool.acquire(taskId);
+      // 2. Acquire worktree (inherit predecessor's branch if dependency exists)
+      const baseBranch = this.resolveBaseBranch(task);
+      console.log(`[agent ${this.agentId}] Acquiring worktree for task ${taskId.slice(0, 8)} (base: ${baseBranch})...`);
+      const handle = this.worktreePool.acquire(taskId, baseBranch);
 
       // 3. Setup checkpoint
       this.checkpoint = new Checkpoint(
@@ -200,6 +201,12 @@ export class AgentWorker {
 
       // 10b. Codebase index hints — query index for relevant symbols
       contextHints.push(...(await this.collectIndexHints(task)));
+
+      // 10c. Predecessor context — what the dependency task did
+      const predecessorHint = this.buildPredecessorHint(task);
+      if (predecessorHint) {
+        contextHints.push(predecessorHint);
+      }
 
       // 11. Execute the actual AI work
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
@@ -419,6 +426,12 @@ export class AgentWorker {
     // Codebase index hints for read-only analysis — helps the agent locate relevant code
     contextHints.push(...(await this.collectIndexHints(task)));
 
+    // Predecessor context — what the dependency task did
+    const predecessorHint = this.buildPredecessorHint(task);
+    if (predecessorHint) {
+      contextHints.push(predecessorHint);
+    }
+
     // Execute the AI analysis
     console.log(`[agent ${this.agentId}] Starting read-only analysis for task ${taskId.slice(0, 8)}`);
     const { stdout } = await executor(worktreePath, task, contextHints);
@@ -500,5 +513,75 @@ export class AgentWorker {
     this.activeLockFiles = [];
     this.currentTask = null;
     this.checkpoint = null;
+  }
+
+  // ---- Dependency chain support ----
+
+  /**
+   * Resolve the base branch for a task's worktree.
+   *
+   * If the task has a dependency, use the predecessor's agent branch so
+   * the new worktree inherits all prior code changes. Falls back to main
+   * if the predecessor's branch doesn't exist (e.g. read-only task, push
+   * failure, or branch not yet replicated).
+   */
+  private resolveBaseBranch(task: Task): string {
+    if (!task.dependency) return "main";
+
+    const branch = `agent/${task.dependency}`;
+
+    // Check remote first (agent pushes to origin on completion)
+    try {
+      execSync(`git rev-parse --verify origin/${branch}`, {
+        cwd: this.repoRoot,
+        stdio: "pipe",
+        timeout: 5000,
+      });
+      return branch;
+    } catch { /* not on remote */ }
+
+    // Check local (same-agent continuation, branch may not be pushed yet)
+    try {
+      execSync(`git rev-parse --verify ${branch}`, {
+        cwd: this.repoRoot,
+        stdio: "pipe",
+        timeout: 5000,
+      });
+      return branch;
+    } catch { /* not local either */ }
+
+    console.log(`[agent ${this.agentId}] Predecessor branch ${branch} not found, falling back to main`);
+    return "main";
+  }
+
+  /**
+   * Build a [PREDECESSOR] context hint describing the dependency task.
+   *
+   * Injects the predecessor's description, modified files, and summary
+   * so the agent understands why the code is already in its current state.
+   */
+  private buildPredecessorHint(task: Task): string | null {
+    if (!task.dependency) return null;
+
+    const depTask = this.taskStore.getTask(task.dependency);
+    if (!depTask) return null;
+
+    const depKnowledge = this.knowledgeStore
+      .loadAll()
+      .filter((k) => k.task_id === task.dependency);
+
+    const lines: string[] = [];
+    lines.push(`[PREDECESSOR] This task continues from Task ${task.dependency.slice(0, 8)}`);
+    lines.push(`  Description: ${depTask.description}`);
+    lines.push(`  Files: ${depTask.target_files.join(", ") || "(none)"}`);
+    lines.push(`  Status:  ${depTask.status}`);
+    lines.push(`  Your worktree already contains all code changes from the predecessor.`);
+    lines.push(`  Build on top of it — do NOT re-implement or revert existing changes.`);
+
+    if (depKnowledge.length > 0 && depKnowledge[0].summary) {
+      lines.push(`  Summary: ${depKnowledge[0].summary.slice(0, 300)}`);
+    }
+
+    return lines.join("\n");
   }
 }
