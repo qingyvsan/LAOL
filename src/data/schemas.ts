@@ -226,6 +226,8 @@ export const LaolConfigSchema = z.object({
     stable_ttl_ms: z.number().int().min(30000).default(180000),
     stable_threshold: z.number().int().min(1).default(2),
     probe_timeout_ms: z.number().int().min(10000).default(45000),
+    lock_waiting_timeout_ms: z.number().int().min(30000).max(3600000).default(600000),
+    deadlock_detection_enabled: z.boolean().default(true),
   }),
   claude_executor: z.object({
     binary_path: z.string().default("claude"),

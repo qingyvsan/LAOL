@@ -18,8 +18,9 @@ import { EventEmitter } from "node:events";
  *   {"type":"merge_completed","task_id":"uuid"}
  *   {"type":"warning","task_id":"uuid","message":"..."}
  *   {"type":"lease_expired","file":"src/auth.ts"}
+ *   {"type":"lock_waiting","task_id":"uuid","files":["src/x.ts"],"reason":"Waiting for lock held by agent-002"}
  *   {"type":"lock_granted","task_id":"uuid","files":["src/x.ts"]}
- *   {"type":"lock_denied","task_id":"uuid","files":["src/x.ts"],"reason":"File locked by agent-002"}
+ *   {"type":"lock_denied","task_id":"uuid","files":["src/x.ts"],"reason":"Deadlock detected"}
  */
 
 export interface SocketMessage {
@@ -144,6 +145,19 @@ export class SocketServer extends EventEmitter {
       type: "lock_granted",
       task_id: taskId,
       files,
+    });
+  }
+
+  /**
+   * Send a lock_waiting message to an agent — the lock is held by
+   * another agent but the request is queued and will be retried.
+   */
+  sendLockWaiting(agentId: string, taskId: string, files: string[], reason: string): boolean {
+    return this.sendToAgent(agentId, {
+      type: "lock_waiting",
+      task_id: taskId,
+      files,
+      reason,
     });
   }
 

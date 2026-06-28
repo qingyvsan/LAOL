@@ -13,7 +13,7 @@ import { CircuitBreaker } from "./circuit-breaker";
 import { SocketServer } from "../events/socket-server";
 import { WalManager } from "../wal/wal-manager";
 import { loadConfig } from "../config";
-import type { Task, Lock, LaolConfig } from "../data/models";
+import type { Task, Lock, LaolConfig, WaitingLockRequest } from "../data/models";
 
 /**
  * Scheduler — the event-driven central orchestrator.
@@ -53,6 +53,18 @@ export class Scheduler {
 
   // Per-agent lock tracking: agentId → Set<file> (dynamic, grows during execution)
   private agentLocks = new Map<string, Set<string>>();
+
+  // Runtime lock waiting queue: file → list of waiting requests
+  private waitingLockRequests = new Map<string, WaitingLockRequest[]>();
+
+  // Wait-for graph for deadlock detection: agentId → set of agent IDs it's waiting for
+  private waitForGraph = new Map<string, Set<string>>();
+
+  // Per-request timeout timers for lock waiting
+  private lockWaitingTimers = new Map<string, NodeJS.Timeout>();
+
+  // Interval timer for refreshing waiting agents
+  private refreshTimer: NodeJS.Timeout | null = null;
 
   constructor(repoRoot: string) {
     this.repoRoot = repoRoot;
@@ -177,7 +189,10 @@ export class Scheduler {
     this.healthMonitor.start();
     console.log("[scheduler] Health monitor started");
 
-    // 7. Scan for existing pending tasks
+    // 7. Start lock-waiting refresh timer (prevents agent timeout while queued)
+    this.refreshTimer = setInterval(() => this.refreshWaitingAgents(), 30_000);
+
+    // 8. Scan for existing pending tasks
     const existingPending = this.taskWatcher.scanExisting();
     console.log(`[scheduler] Found ${existingPending.length} pending tasks`);
 
@@ -191,6 +206,15 @@ export class Scheduler {
    * Stop the scheduler gracefully.
    */
   async stop(): Promise<void> {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+    // Clear all waiting lock timers
+    for (const [, timer] of this.lockWaitingTimers) {
+      clearTimeout(timer);
+    }
+    this.lockWaitingTimers.clear();
     this.healthMonitor.stop();
     await this.taskWatcher.stop();
     await this.socketServer.stop();
@@ -408,10 +432,15 @@ export class Scheduler {
     this.eventBus.emit("agent_disconnected", agentId);
     console.log(`[scheduler] Agent "${agentId}" disconnected`);
 
+    // Clean up waiting lock requests and wait-for edges
+    this.cleanupWaitingAgent(agentId);
+    this.clearWaitForEdges(agentId);
+
     // Release any locks held by this agent
     const released = this.lockManager.releaseAllForAgent(agentId);
     for (const file of released) {
       this.eventBus.emit("lock_released", file);
+      this.retryWaitingLockRequests(file);
     }
 
     // If the agent had an in-progress task, reset it to pending
@@ -432,10 +461,15 @@ export class Scheduler {
     this.agents.delete(agentId);
     this.circuitBreaker.removeAgent(agentId);
 
+    // Clean up waiting lock requests and wait-for edges
+    this.cleanupWaitingAgent(agentId);
+    this.clearWaitForEdges(agentId);
+
     // Release all locks
     const released = this.lockManager.releaseAllForAgent(agentId);
     for (const file of released) {
       this.eventBus.emit("lock_released", file);
+      this.retryWaitingLockRequests(file);
     }
 
     // Reset its current task
@@ -460,9 +494,13 @@ export class Scheduler {
       for (const file of heldLocks) {
         this.lockManager.release(file);
         this.eventBus.emit("lock_released", file);
+        this.retryWaitingLockRequests(file);
       }
       this.agentLocks.delete(agentId);
     }
+
+    // Clean up wait-for edges for the completed agent
+    this.clearWaitForEdges(agentId);
 
     // Update task with the full file set discovered during execution
     this.taskStore.updateTask(taskId, () => ({
@@ -497,9 +535,13 @@ export class Scheduler {
       for (const file of heldLocks) {
         this.lockManager.release(file);
         this.eventBus.emit("lock_released", file);
+        this.retryWaitingLockRequests(file);
       }
       this.agentLocks.delete(agentId);
     }
+
+    // Clean up wait-for edges for the failed agent
+    this.clearWaitForEdges(agentId);
 
     // Circuit breaker: failure
     const { agentState, taskStuck } = this.circuitBreaker.onTaskFailure(
@@ -565,7 +607,10 @@ export class Scheduler {
 
   /**
    * Handle a lock_request from an agent: run conflict check + acquire locks
-   * for the requested files, then respond with lock_granted or lock_denied.
+   * for the requested files, then respond with lock_granted, lock_waiting, or lock_denied.
+   *
+   * When a lock is held by another agent, the request is queued (lock_waiting)
+   * instead of rejected immediately. Deadlock detection runs before queuing.
    */
   private handleLockRequest(agentId: string, taskId: string, files: string[]): void {
     // Deduplicate and check which files the agent already has locked
@@ -578,19 +623,56 @@ export class Scheduler {
       return;
     }
 
-    // Check conflicts for the new files
-    const directConflict = this.lockManager.findConflict(newFiles);
-    if (directConflict) {
-      this.socketServer.sendLockDenied(
-        agentId,
-        taskId,
-        [directConflict.file],
-        `File "${directConflict.file}" is locked by agent "${directConflict.holder}"`
-      );
+    // Check if this task is already waiting for any of the requested files (dedup)
+    const alreadyWaiting = this.isTaskWaitingForAnyFile(taskId, newFiles);
+    if (alreadyWaiting.size > 0) {
+      this.socketServer.sendLockWaiting(agentId, taskId, [...alreadyWaiting],
+        `Still waiting for locks on: ${[...alreadyWaiting].join(", ")}`);
       return;
     }
 
-    // Acquire locks atomically (WAL-protected)
+    // Check conflicts for the new files
+    const directConflict = this.lockManager.findConflict(newFiles);
+    if (directConflict) {
+      const conflictHolder = directConflict.holder;
+      const conflictFile = directConflict.file;
+
+      // Enqueue the request for each conflicting file
+      this.enqueueWaitingLockRequest(conflictFile, {
+        taskId, agentId, files: newFiles, requestedAt: Date.now(),
+      });
+
+      // Add edge to wait-for graph
+      this.addWaitForEdge(agentId, conflictHolder);
+
+      // Deadlock detection (if enabled)
+      if (this.config.locks.deadlock_detection_enabled) {
+        const cycle = this.detectDeadlockCycle(agentId);
+        if (cycle) {
+          // Deadlock detected — break by denying the youngest agent in the cycle
+          this.resolveDeadlock(cycle, taskId);
+          return;
+        }
+      }
+
+      // No deadlock — tell agent to wait
+      this.socketServer.sendLockWaiting(agentId, taskId, newFiles,
+        `File "${conflictFile}" is locked by agent "${conflictHolder}". Queued for retry.`);
+
+      // Set a global timeout for this waiting request
+      const timeoutMs = this.config.locks.lock_waiting_timeout_ms;
+      const timerKey = `${taskId}:${agentId}`;
+      const timer = setTimeout(() => {
+        this.cleanupWaitingRequest(taskId, agentId);
+        this.socketServer.sendLockDenied(agentId, taskId, newFiles,
+          `Lock waiting timed out after ${Math.round(timeoutMs / 1000)}s`);
+      }, timeoutMs);
+      this.lockWaitingTimers.set(timerKey, timer);
+
+      return;
+    }
+
+    // No conflict — acquire locks atomically (WAL-protected)
     try {
       this.walManager.write({ op: "acquire_lock", task: taskId, agent: agentId, files: newFiles });
 
@@ -666,6 +748,207 @@ export class Scheduler {
       });
     } catch {
       // best effort
+    }
+  }
+
+  // ---- Lock Waiting Queue & Deadlock Detection ----
+
+  /** Enqueue a waiting lock request for a specific file. */
+  private enqueueWaitingLockRequest(file: string, req: WaitingLockRequest): void {
+    if (!this.waitingLockRequests.has(file)) {
+      this.waitingLockRequests.set(file, []);
+    }
+    this.waitingLockRequests.get(file)!.push(req);
+  }
+
+  /** Add an edge to the wait-for graph: waiter → holder. */
+  private addWaitForEdge(waiter: string, holder: string): void {
+    if (!this.waitForGraph.has(waiter)) {
+      this.waitForGraph.set(waiter, new Set());
+    }
+    this.waitForGraph.get(waiter)!.add(holder);
+  }
+
+  /** Check if a task is already waiting for any of the given files. */
+  private isTaskWaitingForAnyFile(taskId: string, files: string[]): Set<string> {
+    const result = new Set<string>();
+    for (const file of files) {
+      const queue = this.waitingLockRequests.get(file);
+      if (queue) {
+        for (const req of queue) {
+          if (req.taskId === taskId) {
+            result.add(file);
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Retry waiting lock requests for a file that was just released.
+   * Called when locks are released in handleTaskCompleted/handleTaskFailed.
+   */
+  private retryWaitingLockRequests(file: string): void {
+    const queue = this.waitingLockRequests.get(file);
+    if (!queue || queue.length === 0) return;
+
+    // Copy and clear — requests will be re-added if they still can't proceed
+    const requests = [...queue];
+    this.waitingLockRequests.delete(file);
+
+    for (const req of requests) {
+      // Check if the agent is still connected
+      if (!this.agents.has(req.agentId)) {
+        this.clearWaitForEdges(req.agentId);
+        continue;
+      }
+
+      // Re-check conflicts (another agent may have grabbed the lock)
+      const conflict = this.lockManager.findConflict(req.files);
+      if (conflict) {
+        // Still blocked — re-enqueue for the new conflicting file
+        this.enqueueWaitingLockRequest(conflict.file, req);
+        continue;
+      }
+
+      // Locks are now free — acquire and grant
+      this.clearWaitForEdges(req.agentId);
+      const timerKey = `${req.taskId}:${req.agentId}`;
+      const timer = this.lockWaitingTimers.get(timerKey);
+      if (timer) {
+        clearTimeout(timer);
+        this.lockWaitingTimers.delete(timerKey);
+      }
+      this.handleLockRequest(req.agentId, req.taskId, req.files);
+    }
+  }
+
+  /**
+   * DFS cycle detection on the wait-for graph.
+   * Returns the cycle path (array of agent IDs), or null if no cycle.
+   */
+  private detectDeadlockCycle(startAgent: string): string[] | null {
+    const visited = new Set<string>();
+    const path: string[] = [];
+
+    const dfs = (agent: string): boolean => {
+      if (path.includes(agent)) {
+        // Cycle found — include the repeated agent to show the loop
+        path.push(agent);
+        return true;
+      }
+      if (visited.has(agent)) return false;
+
+      visited.add(agent);
+      path.push(agent);
+
+      const waitFor = this.waitForGraph.get(agent);
+      if (waitFor) {
+        for (const target of waitFor) {
+          if (dfs(target)) return true;
+        }
+      }
+
+      path.pop();
+      return false;
+    };
+
+    return dfs(startAgent) ? path : null;
+  }
+
+  /**
+   * Resolve a deadlock: pick the agent with the latest request in the cycle
+   * and deny its lock request. Cleans up edges for all agents in the cycle.
+   */
+  private resolveDeadlock(cycle: string[], originatingTaskId: string): void {
+    // Find the youngest request (most recent) in the cycle
+    let youngestAgent = cycle[0];
+    let latestTime = 0;
+
+    for (const agentId of cycle) {
+      for (const [, queue] of this.waitingLockRequests) {
+        for (const req of queue) {
+          if (req.agentId === agentId && req.requestedAt > latestTime) {
+            latestTime = req.requestedAt;
+            youngestAgent = agentId;
+          }
+        }
+      }
+    }
+
+    console.log(`[scheduler] Deadlock detected in cycle: ${cycle.join(" → ")}. Breaking at ${youngestAgent}.`);
+
+    // Deny the youngest agent's lock request (the one that created the cycle)
+    this.socketServer.sendLockDenied(youngestAgent, originatingTaskId, [],
+      `Deadlock detected: your lock request would create a circular wait. Retry the task.`);
+
+    // Clean up all agents in the cycle
+    for (const agentId of cycle) {
+      this.cleanupWaitingAgent(agentId);
+      this.clearWaitForEdges(agentId);
+    }
+  }
+
+  /** Remove all waiting lock requests for a given agent. */
+  private cleanupWaitingAgent(agentId: string): void {
+    for (const [file, queue] of this.waitingLockRequests) {
+      const filtered = queue.filter((r) => r.agentId !== agentId);
+      if (filtered.length === 0) {
+        this.waitingLockRequests.delete(file);
+      } else {
+        this.waitingLockRequests.set(file, filtered);
+      }
+    }
+    // Clear related timers
+    for (const [key, timer] of this.lockWaitingTimers) {
+      if (key.endsWith(`:${agentId}`)) {
+        clearTimeout(timer);
+        this.lockWaitingTimers.delete(key);
+      }
+    }
+  }
+
+  /** Clean up a specific waiting request by task and agent. */
+  private cleanupWaitingRequest(taskId: string, agentId: string): void {
+    for (const [file, queue] of this.waitingLockRequests) {
+      const filtered = queue.filter((r) => !(r.taskId === taskId && r.agentId === agentId));
+      if (filtered.length === 0) {
+        this.waitingLockRequests.delete(file);
+      } else {
+        this.waitingLockRequests.set(file, filtered);
+      }
+    }
+    const timerKey = `${taskId}:${agentId}`;
+    const timer = this.lockWaitingTimers.get(timerKey);
+    if (timer) {
+      clearTimeout(timer);
+      this.lockWaitingTimers.delete(timerKey);
+    }
+    this.clearWaitForEdges(agentId);
+  }
+
+  /** Remove wait-for edges for an agent (both outgoing and incoming). */
+  private clearWaitForEdges(agentId: string): void {
+    this.waitForGraph.delete(agentId);
+    for (const [, targets] of this.waitForGraph) {
+      targets.delete(agentId);
+    }
+  }
+
+  /**
+   * Periodically re-send lock_waiting to agents still in the queue
+   * to prevent their requestLocksAsync timeout from firing.
+   */
+  private refreshWaitingAgents(): void {
+    for (const [file, queue] of this.waitingLockRequests) {
+      for (const req of queue) {
+        const lock = this.lockManager.getLock(file);
+        if (lock) {
+          this.socketServer.sendLockWaiting(req.agentId, req.taskId, req.files,
+            `Still waiting for "${file}" (held by ${lock.holder})...`);
+        }
+      }
     }
   }
 

@@ -41,6 +41,8 @@ export const DEFAULT_CONFIG: LaolConfig = {
     stable_ttl_ms: 180000,
     stable_threshold: 2,
     probe_timeout_ms: 45000,
+    lock_waiting_timeout_ms: 600_000,
+    deadlock_detection_enabled: true,
   },
   claude_executor: {
     binary_path: "claude",

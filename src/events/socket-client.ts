@@ -154,16 +154,23 @@ export class SocketClient extends EventEmitter {
    */
   async requestLocksAsync(taskId: string, files: string[]): Promise<string[]> {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      const INITIAL_TIMEOUT_MS = 30000;
+      let timeout: NodeJS.Timeout;
+
+      const createTimeout = () => setTimeout(() => {
         this.off("lock_granted", onGranted);
         this.off("lock_denied", onDenied);
+        this.off("lock_waiting", onWaiting);
         reject(new Error(`Lock request timed out for task ${taskId.slice(0, 8)}`));
-      }, 30000);
+      }, INITIAL_TIMEOUT_MS);
+
+      timeout = createTimeout();
 
       const onGranted = (msg: SocketMessage) => {
         if (msg.task_id === taskId) {
           clearTimeout(timeout);
           this.off("lock_denied", onDenied);
+          this.off("lock_waiting", onWaiting);
           resolve((msg.files as string[]) ?? []);
         }
       };
@@ -172,12 +179,24 @@ export class SocketClient extends EventEmitter {
         if (msg.task_id === taskId) {
           clearTimeout(timeout);
           this.off("lock_granted", onGranted);
+          this.off("lock_waiting", onWaiting);
           reject(new Error((msg.reason as string) ?? "Lock request denied"));
+        }
+      };
+
+      // lock_waiting: the scheduler has queued our request and will retry
+      // when the lock becomes available. Reset the timeout to keep waiting.
+      const onWaiting = (msg: SocketMessage) => {
+        if (msg.task_id === taskId) {
+          console.log(`[socket-client] Lock request queued: ${msg.reason}`);
+          clearTimeout(timeout);
+          timeout = createTimeout();
         }
       };
 
       this.on("lock_granted", onGranted);
       this.on("lock_denied", onDenied);
+      this.on("lock_waiting", onWaiting);
 
       // Send the request
       const sent = this.send({
@@ -191,6 +210,7 @@ export class SocketClient extends EventEmitter {
         clearTimeout(timeout);
         this.off("lock_granted", onGranted);
         this.off("lock_denied", onDenied);
+        this.off("lock_waiting", onWaiting);
         reject(new Error("Failed to send lock request (not connected)"));
       }
     });

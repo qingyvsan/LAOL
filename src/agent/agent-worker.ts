@@ -213,7 +213,52 @@ export class AgentWorker {
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
       await executor(handle.path, task, contextHints);
 
-      // 11b. Collect post-task deltas from live providers
+      // 11b. Post-execution lock validation — detect files modified without locks
+      const modifiedFiles = this.getModifiedFiles(handle.path);
+      const unownedFiles = modifiedFiles.filter((f) => !this.activeLockFiles.includes(f));
+
+      if (unownedFiles.length > 0) {
+        console.log(
+          `[agent ${this.agentId}] Detected ${unownedFiles.length} modified files without locks: ${unownedFiles.join(", ")}`
+        );
+
+        try {
+          const granted = await this.expandLocks(unownedFiles);
+          const denied = unownedFiles.filter((f) => !granted.includes(f));
+
+          if (denied.length > 0) {
+            // Revert changes to files we couldn't lock
+            for (const file of denied) {
+              this.revertFile(handle.path, file);
+            }
+
+            const warning =
+              `[WARNING] Modified files could not be locked (held by other agents). ` +
+              `Changes were REVERTED: ${denied.join(", ")}. ` +
+              `Create a follow-up task targeting these files if changes are needed.`;
+            console.warn(`[agent ${this.agentId}] ${warning}`);
+
+            // Store warning in task metadata for the user to see
+            this.taskStore.updateTask(taskId, (t) => ({
+              metadata: {
+                ...t.metadata,
+                reverted_files: denied,
+                reverted_files_warning: warning,
+              },
+            }));
+          }
+        } catch (err) {
+          // expandLocks failed entirely — revert all unowned changes
+          console.warn(
+            `[agent ${this.agentId}] Lock expansion failed: ${err}. Reverting all unowned changes.`
+          );
+          for (const file of unownedFiles) {
+            this.revertFile(handle.path, file);
+          }
+        }
+      }
+
+      // 11c. Collect post-task deltas from live providers
       const { deltas } = await this.contextManager.collectPostHints(
         task,
         handle.path,
@@ -233,7 +278,18 @@ export class AgentWorker {
         });
       }
 
-      // 12. Commit changes
+      // 12. Pre-commit rebase — ensure worktree is up to date with origin/main
+      const conflictFiles = this.preCommitRebase(handle.path);
+      if (conflictFiles.length > 0) {
+        const msg =
+          `Pre-commit rebase conflict: another agent modified ${conflictFiles.join(", ")} ` +
+          `while this task was running. The changes cannot be cleanly applied. ` +
+          `Create a new task targeting these files with the updated base.`;
+        this.failTask(taskId, msg);
+        return;
+      }
+
+      // 13. Commit changes
       this.commitChanges(handle.path, task);
 
       // 12b. Re-index modified files so the shared symbol index stays fresh
@@ -297,6 +353,156 @@ export class AgentWorker {
   }
 
   // ---- Lifecycle ----
+
+  /**
+   * Get the list of files modified by the executor in the worktree.
+   * Uses git diff to detect changes from HEAD.
+   */
+  private getModifiedFiles(worktreePath: string): string[] {
+    try {
+      const output = execSync("git diff --name-only HEAD", {
+        cwd: worktreePath,
+        stdio: "pipe",
+        timeout: 5000,
+      }).toString().trim();
+
+      if (!output) return [];
+      return output.split("\n").filter((f) => f.length > 0);
+    } catch (err) {
+      console.warn(`[agent ${this.agentId}] Failed to detect modified files: ${err}`);
+      return [];
+    }
+  }
+
+  /**
+   * Revert changes to a specific file in the worktree.
+   */
+  private revertFile(worktreePath: string, file: string): void {
+    try {
+      execSync(`git checkout -- "${file}"`, {
+        cwd: worktreePath,
+        stdio: "pipe",
+        timeout: 5000,
+      });
+      console.log(`[agent ${this.agentId}] Reverted un-lockable file: ${file}`);
+    } catch (err) {
+      console.warn(`[agent ${this.agentId}] Failed to revert "${file}": ${err}`);
+    }
+  }
+
+  /**
+   * Get files that conflicted during a rebase attempt.
+   */
+  private getRebaseConflictFiles(worktreePath: string): string[] {
+    try {
+      const output = execSync("git diff --name-only --diff-filter=U", {
+        cwd: worktreePath,
+        stdio: "pipe",
+        timeout: 5000,
+      }).toString().trim();
+      return output ? output.split("\n") : ["<unknown conflict files>"];
+    } catch {
+      return ["<unknown conflict files>"];
+    }
+  }
+
+  /**
+   * Pre-commit rebase: stash changes, fetch latest main, rebase, pop stash.
+   * Returns an array of conflicted file paths, or empty if successful.
+   */
+  private preCommitRebase(worktreePath: string): string[] {
+    try {
+      // 1. Stash any uncommitted changes
+      const stashOutput = execSync('git stash push -m "laol-pre-commit-rebase"', {
+        cwd: worktreePath,
+        stdio: "pipe",
+        timeout: 5000,
+      }).toString().trim();
+
+      const hadStash = !stashOutput.includes("No local changes to save");
+
+      // 2. Fetch latest
+      execSync("git fetch origin main", {
+        cwd: worktreePath,
+        stdio: "pipe",
+        timeout: 15_000,
+      });
+
+      // 3. Check if behind origin/main
+      let behindCount = 0;
+      try {
+        const result = execSync("git rev-list --count HEAD..origin/main", {
+          cwd: worktreePath,
+          stdio: "pipe",
+          timeout: 5000,
+        }).toString().trim();
+        behindCount = parseInt(result, 10) || 0;
+      } catch {
+        behindCount = 0;
+      }
+
+      if (behindCount === 0) {
+        // Not behind — restore stash if we had one
+        if (hadStash) {
+          execSync("git stash pop", { cwd: worktreePath, stdio: "pipe", timeout: 5000 });
+        }
+        return [];
+      }
+
+      console.log(`[agent ${this.agentId}] Pre-commit: ${behindCount} commits behind — rebasing...`);
+
+      // 4. Rebase
+      try {
+        execSync("git rebase origin/main", {
+          cwd: worktreePath,
+          stdio: "pipe",
+          timeout: 30_000,
+        });
+      } catch {
+        // Rebase conflict — abort and return conflicted files
+        execSync("git rebase --abort", {
+          cwd: worktreePath,
+          stdio: "pipe",
+          timeout: 5000,
+        });
+
+        const conflictFiles = this.getRebaseConflictFiles(worktreePath);
+
+        // Restore stash
+        if (hadStash) {
+          try {
+            execSync("git stash pop", { cwd: worktreePath, stdio: "pipe", timeout: 5000 });
+          } catch { /* stash pop may also conflict — best effort */ }
+        }
+
+        return conflictFiles;
+      }
+
+      // 5. Pop stash
+      if (hadStash) {
+        try {
+          execSync("git stash pop", {
+            cwd: worktreePath,
+            stdio: "pipe",
+            timeout: 10_000,
+          });
+        } catch {
+          // Stash pop conflict with rebased code
+          const diffFiles = execSync("git diff --name-only --diff-filter=U", {
+            cwd: worktreePath,
+            stdio: "pipe",
+            timeout: 5000,
+          }).toString().trim();
+          return diffFiles ? diffFiles.split("\n") : ["<stash-pop conflict>"];
+        }
+      }
+
+      return [];
+    } catch (err) {
+      console.warn(`[agent ${this.agentId}] Pre-commit rebase error: ${err}`);
+      return [];
+    }
+  }
 
   private commitChanges(worktreePath: string, task: Task): void {
     try {

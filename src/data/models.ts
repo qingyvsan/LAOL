@@ -225,6 +225,16 @@ export interface AcquireResult {
   locks?: Lock[];
 }
 
+// --- Waiting Lock Request (scheduler queue) ---
+
+/** A lock request parked in the waiting queue when the target file is held by another agent. */
+export interface WaitingLockRequest {
+  taskId: string;
+  agentId: string;
+  files: string[];
+  requestedAt: number;
+}
+
 // --- Worktree Entry ---
 
 export interface WorktreeEntry {
@@ -400,6 +410,10 @@ export interface LaolConfig {
     stable_ttl_ms: number;
     stable_threshold: number;
     probe_timeout_ms: number;
+    /** Max time an agent waits in the lock queue before giving up (ms). Default: 600_000 (10 min). */
+    lock_waiting_timeout_ms: number;
+    /** Enable cycle detection in the wait-for graph. Default: true. */
+    deadlock_detection_enabled: boolean;
   };
   claude_executor: {
     binary_path: string;
