@@ -243,6 +243,9 @@ export class CodebaseIndexer {
     lines.push(`> Generated: ${builtTime} | ${filtered.length} files`);
     lines.push("");
 
+    // Project overview: stats, entry points, file tree
+    this.buildOverview(index, filtered, lines);
+
     // Table of contents
     lines.push("## Table of Contents");
     lines.push("");
@@ -369,6 +372,130 @@ export class CodebaseIndexer {
     lines.push(`_${filtered.length} files, ${totalSymbols} symbols documented._`);
 
     return lines.join("\n");
+  }
+
+  /**
+   * Build a project overview section for the generated docs.
+   *
+   * Includes: quick stats, entry point detection (heuristic), and a
+   * file-tree summary with symbol counts per top-level directory.
+   * All data comes from the existing index — no re-extraction needed.
+   */
+  private buildOverview(
+    index: CodebaseIndex,
+    filtered: string[],
+    lines: string[]
+  ): void {
+    // ---- Quick stats ----
+    let totalSymbols = 0;
+    const kindCounts: Record<string, number> = {};
+    for (const file of filtered) {
+      const entry = index[file];
+      if (!entry) continue;
+      totalSymbols += entry.symbols.length;
+      for (const sym of entry.symbols) {
+        kindCounts[sym.kind] = (kindCounts[sym.kind] ?? 0) + 1;
+      }
+    }
+
+    lines.push("## Project Overview");
+    lines.push("");
+    lines.push(`| | |`);
+    lines.push(`|---|---|`);
+    lines.push(`| **Files indexed** | ${filtered.length} |`);
+    lines.push(`| **Total symbols** | ${totalSymbols} |`);
+
+    const kindLabels: Record<string, string> = {
+      class: "Classes", function: "Functions", interface: "Interfaces",
+      type: "Type aliases", const: "Constants", module: "Modules",
+      decorator: "Decorators",
+    };
+    const kindOrder = ["class", "function", "interface", "type", "const", "module", "decorator"];
+    for (const kind of kindOrder) {
+      const count = kindCounts[kind];
+      if (count) {
+        lines.push(`| **${kindLabels[kind] ?? kind}** | ${count} |`);
+      }
+    }
+    lines.push("");
+
+    // ---- Entry points ----
+    // Heuristic: exported symbols matching common entry-point patterns.
+    // Organized as regexes tested against the symbol name for readability.
+    const ENTRY_PATTERNS: RegExp[] = [
+      // Exact matches (case-insensitive)
+      /^(main|app|createApp|bootstrap|setup|init|run|start|serve|server|handler|default|__main__)$/i,
+      // Factory / constructor functions
+      /^create[A-Z]/,            // createApp, createServer, createRouter
+      /^build[A-Z]/,             // buildConfig, buildApp
+      /^new[A-Z]/,               // newServer, newClient
+      // App classes (PascalCase ending in App)
+      /^[A-Z][a-zA-Z]*App$/,
+      // Framework entry points (Next.js, Remix, SvelteKit, Astro, etc.)
+      /^(getServerSideProps|getStaticProps|getStaticPaths|generateStaticParams|generateMetadata)$/i,
+      /^(loader|action|headers|links|meta)$/i,         // Remix / React Router
+      /^(handle|handleRequest|handleEvent)$/i,         // generic request handlers
+      /^(render|renderPage|renderApp|renderToString)$/i,
+      // Lifecycle / config
+      /^(config|configure)$/i,
+      /^(mount|unmount|onMount|onDestroy)$/i,
+      /^(middleware|interceptor|plugin)$/i,
+      // Index / barrel
+      /^index$/i,
+      // Route definition
+      /^(routes?|router|createRouter|defineRoutes?)$/i,
+    ];
+
+    const entryPoints: string[] = [];
+    for (const file of filtered) {
+      const entry = index[file];
+      if (!entry) continue;
+      for (const sym of entry.symbols) {
+        if (!sym.exported) continue;
+        const match = ENTRY_PATTERNS.some((re) => re.test(sym.name));
+        if (match) {
+          entryPoints.push(
+            `- \`${sym.name}\` (${sym.kind}) in [${file}](#${this.slug(file)})`
+          );
+        }
+      }
+    }
+
+    if (entryPoints.length > 0) {
+      lines.push("### Likely Entry Points");
+      lines.push("");
+      const unique = [...new Set(entryPoints)].slice(0, 12);
+      for (const ep of unique) {
+        lines.push(ep);
+      }
+      if (entryPoints.length > 12) {
+        lines.push(`- ... and ${entryPoints.length - 12} more`);
+      }
+      lines.push("");
+    }
+
+    // ---- Directory tree ----
+    const dirMap = new Map<string, { files: number; symbols: number }>();
+    for (const file of filtered) {
+      const entry = index[file];
+      const dir = file.includes("/") ? file.split("/")[0] : "(root)";
+      const existing = dirMap.get(dir) ?? { files: 0, symbols: 0 };
+      existing.files++;
+      existing.symbols += entry?.symbols.length ?? 0;
+      dirMap.set(dir, existing);
+    }
+
+    if (dirMap.size > 0) {
+      lines.push("### Top-level Structure");
+      lines.push("");
+      lines.push(`| Directory | Files | Symbols |`);
+      lines.push(`|---|---|---|`);
+      const sorted = [...dirMap.entries()].sort((a, b) => b[1].symbols - a[1].symbols);
+      for (const [dir, info] of sorted) {
+        lines.push(`| \`${dir}/\` | ${info.files} | ${info.symbols} |`);
+      }
+      lines.push("");
+    }
   }
 
   // ---- Internal ----

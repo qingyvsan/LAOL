@@ -93,21 +93,8 @@ export class LeaseManager {
     const newPhase: LockPhase =
       nextRenewCount >= this.STABLE_THRESHOLD ? "stable" : "initial";
     const newTtl = newPhase === "stable" ? this.STABLE_TTL_MS : this.INITIAL_TTL_MS;
-    const now = Date.now();
 
-    const updated = this.lockManager.renew(file, agentId, now + newTtl);
-
-    if (updated && newPhase !== current.phase) {
-      // Phase transition happened — write the updated phase
-      updated.phase = newPhase;
-      LockSchema.parse(updated);
-      // The lock manager wrote via renew already, but we need to update phase.
-      // Read, update phase, write back atomically.
-      // (Minor: this is a second write, but phase transitions are rare — only twice per lock)
-      return this.lockManager.renew(file, agentId, now + newTtl);
-    }
-
-    return updated;
+    return this.lockManager.renew(file, agentId, Date.now() + newTtl, newPhase);
   }
 
   /**

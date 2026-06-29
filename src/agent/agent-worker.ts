@@ -279,6 +279,34 @@ export class AgentWorker {
         contextHints.push(predecessorHint);
       }
 
+      // 10c. Write API reference to worktree so the agent can look up symbols
+      // and project structure on demand during the session.
+      try {
+        const indexer = new CodebaseIndexer(this.repoRoot);
+        const stats = indexer.getStats();
+        if (stats.totalFiles > 0) {
+          const apiDocs = indexer.generateDocs();
+          const apiRefDir = path.join(handle.path, ".multiagent");
+          if (!fs.existsSync(apiRefDir)) {
+            fs.mkdirSync(apiRefDir, { recursive: true });
+          }
+          fs.writeFileSync(
+            path.join(apiRefDir, "API_REFERENCE.md"), apiDocs, "utf-8"
+          );
+          contextHints.push(
+            "[API REFERENCE] `.multiagent/API_REFERENCE.md` — " +
+            `${stats.totalSymbols} symbols across ${stats.totalFiles} files. ` +
+            "Read this file (or Grep it) to find symbols, entry points, and " +
+            "project structure before making changes."
+          );
+        }
+      } catch (err) {
+        // Non-fatal — agent can still work without the API reference
+        console.warn(
+          `[agent ${this.agentId}] Could not write API_REFERENCE.md: ${err}`
+        );
+      }
+
       // 11. Execute the actual AI work
       console.log(`[agent ${this.agentId}] Starting work on task ${taskId.slice(0, 8)}`);
       const execResult = await executor(handle.path, task, contextHints);
@@ -566,13 +594,28 @@ export class AgentWorker {
             timeout: 10_000,
           });
         } catch {
-          // Stash pop conflict with rebased code
-          const diffFiles = execSync("git diff --name-only --diff-filter=U", {
-            cwd: worktreePath,
-            stdio: "pipe",
-            timeout: 5000,
-          }).toString().trim();
-          return diffFiles ? diffFiles.split("\n") : ["<stash-pop conflict>"];
+          // Stash pop conflicted with rebased code.
+          // Discard the conflicting stash application (keeping the clean rebased
+          // state) and drop the stash so it doesn't stick around.
+          console.warn(
+            `[agent ${this.agentId}] Stash pop conflict after rebase — discarding stash, keeping rebased code.`
+          );
+          try {
+            execSync("git checkout -- .", {
+              cwd: worktreePath,
+              stdio: "pipe",
+              timeout: 10_000,
+            });
+            execSync("git stash drop", {
+              cwd: worktreePath,
+              stdio: "pipe",
+              timeout: 5000,
+            });
+          } catch {
+            // Best-effort cleanup
+          }
+          // Fall through — return clean (no conflict files). The stashed
+          // changes are lost, but the worktree is consistent.
         }
       }
 
@@ -592,6 +635,25 @@ export class AgentWorker {
   }
 
   private commitChanges(worktreePath: string, task: Task): void {
+    // Refuse to commit if there are unresolved conflict markers in the worktree.
+    // This guards against edge cases where stash-pop leaves <<<<<<< markers
+    // that would otherwise be picked up by git add -A.
+    try {
+      const conflicted = execSync("git diff --name-only --diff-filter=U", {
+        cwd: worktreePath,
+        stdio: "pipe",
+        timeout: 5000,
+      }).toString().trim();
+      if (conflicted) {
+        console.warn(
+          `[agent ${this.agentId}] Refusing to commit: unresolved conflict markers in files — ${conflicted.split("\n").join(", ")}`
+        );
+        return;
+      }
+    } catch {
+      // Proceed — diff-filter check itself may fail in unusual states
+    }
+
     try {
       execSync("git add -A", {
         cwd: worktreePath,
@@ -705,6 +767,34 @@ export class AgentWorker {
     const predecessorHint = this.buildPredecessorHint(task);
     if (predecessorHint) {
       contextHints.push(predecessorHint);
+    }
+
+    // Write API reference to worktree so the agent can look up symbols
+    // and project structure on demand during the session.
+    try {
+      const indexer = new CodebaseIndexer(this.repoRoot);
+      const stats = indexer.getStats();
+      if (stats.totalFiles > 0) {
+        const apiDocs = indexer.generateDocs();
+        const apiRefDir = path.join(worktreePath, ".multiagent");
+        if (!fs.existsSync(apiRefDir)) {
+          fs.mkdirSync(apiRefDir, { recursive: true });
+        }
+        fs.writeFileSync(
+          path.join(apiRefDir, "API_REFERENCE.md"), apiDocs, "utf-8"
+        );
+        contextHints.push(
+          "[API REFERENCE] `.multiagent/API_REFERENCE.md` — " +
+          `${stats.totalSymbols} symbols across ${stats.totalFiles} files. ` +
+          "Read this file (or Grep it) to find symbols, entry points, and " +
+          "project structure before making changes."
+        );
+      }
+    } catch (err) {
+      // Non-fatal — agent can still work without the API reference
+      console.warn(
+        `[agent ${this.agentId}] Could not write API_REFERENCE.md: ${err}`
+      );
     }
 
     // Execute the AI analysis

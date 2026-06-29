@@ -244,15 +244,25 @@ export class ContextManager {
       const isDuplicate = result.some((kept) => {
         if (kept.source === hint.source) return false; // same provider, keep
 
-        // Fast check: same title = likely duplicate
-        if (kept.title === hint.title) return true;
+        // Title match alone is not enough — verify content overlap too.
+        // Two providers may legitimately report different issues under the
+        // same title (e.g. both report "Unused variable" for different vars).
+        if (kept.title === hint.title) {
+          const keptLines = new Set(kept.content.split("\n"));
+          const hintLines = hint.content.split("\n");
+          if (hintLines.length === 0) return false;
+          const overlap = hintLines.filter((l) => keptLines.has(l)).length;
+          return overlap / hintLines.length > 0.5;
+        }
 
-        // Content overlap check: if >60% of lines overlap, treat as duplicate
+        // Content overlap check: require >80% overlap to treat as duplicate
+        // (raised from 60% to avoid suppressing hints that share boilerplate
+        // lines like file paths or error prefixes).
         const keptLines = new Set(kept.content.split("\n"));
         const hintLines = hint.content.split("\n");
         if (hintLines.length === 0) return false;
         const overlap = hintLines.filter((l) => keptLines.has(l)).length;
-        return overlap / hintLines.length > 0.6;
+        return overlap / hintLines.length > 0.8;
       });
 
       if (!isDuplicate) {

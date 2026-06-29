@@ -713,20 +713,36 @@ export class Scheduler {
     this.eventBus.emit("merge_required", task.id, branch);
 
     try {
+      let branchRef = "";
       // Verify the agent branch exists (remote or local)
       try {
-        execSync(`git rev-parse --verify origin/${branch}`, {
+        branchRef = execSync(`git rev-parse --verify origin/${branch}`, {
           cwd: this.repoRoot, stdio: "pipe", timeout: 5000,
-        });
+        }).toString().trim();
       } catch {
         try {
-          execSync(`git rev-parse --verify ${branch}`, {
+          branchRef = execSync(`git rev-parse --verify ${branch}`, {
             cwd: this.repoRoot, stdio: "pipe", timeout: 5000,
-          });
+          }).toString().trim();
         } catch {
           console.log(`[scheduler] Merge skipped: branch "${branch}" not found`);
           return;
         }
+      }
+
+      // Fast check: if the agent branch has no commits beyond main, skip merge.
+      // This avoids unnecessary merge worktree creation for read-only tasks
+      // and discovery-only sessions that didn't produce code changes.
+      try {
+        const baseRef = execSync("git merge-base main " + branchRef, {
+          cwd: this.repoRoot, stdio: "pipe", timeout: 5000,
+        }).toString().trim();
+        if (baseRef === branchRef) {
+          console.log(`[scheduler] Merge skipped: ${branch} has no commits beyond main`);
+          return;
+        }
+      } catch {
+        // Can't determine — proceed with merge to be safe
       }
 
       // Create a temporary worktree for the merge
@@ -1209,6 +1225,15 @@ export class Scheduler {
    * to prevent their requestLocksAsync timeout from firing.
    */
   private refreshWaitingAgents(): void {
+    // Clean up wait-for graph edges for agents that have disconnected.
+    // When deadlock detection is disabled, edges accumulate unboundedly
+    // because they are only cleaned on agent_disconnected or agent_lost.
+    for (const [agentId] of this.waitForGraph) {
+      if (!this.agents.has(agentId)) {
+        this.clearWaitForEdges(agentId);
+      }
+    }
+
     for (const [file, queue] of this.waitingLockRequests) {
       for (const req of queue) {
         const lock = this.lockManager.getLock(file);
@@ -1232,10 +1257,13 @@ export class Scheduler {
   private assignNextPending(): void {
     const pending = this.taskStore.listTasks({ status: "pending" });
     for (const task of pending) {
+      // Stop when no more idle agents are available
+      if (!this.findIdleAgent()) break;
+
       const conflictResult = this.conflictChecker.canAssign(task);
       if (conflictResult.can_assign) {
         this.tryAssignTask(task);
-        break; // assign one at a time
+        // Continue to assign to other idle agents
       }
     }
   }

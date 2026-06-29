@@ -143,7 +143,7 @@ export class LockManager {
    * Renew a lock — updates expires_at and heartbeat.
    * Returns the updated lock, or null if the lock doesn't exist.
    */
-  renew(file: string, agentId: string, newExpiry: number): Lock | null {
+  renew(file: string, agentId: string, newExpiry: number, newPhase?: import("../data/models").LockPhase): Lock | null {
     const lockPath = this.lockPath(file);
     const current = this.readLockFile(lockPath);
 
@@ -155,10 +155,23 @@ export class LockManager {
       expires_at: newExpiry,
       last_heartbeat: Date.now(),
       renew_count: current.renew_count + 1,
+      phase: newPhase ?? current.phase,
     };
 
     LockSchema.parse(updated);
     this.atomicWriteLock(lockPath, updated);
+
+    // Re-read after write to close the TOCTOU window: if the lock was
+    // force-released between our initial read and the atomic write, the
+    // write would have resurrected the lock file. Verify the file on disk
+    // still matches what we just wrote before returning success.
+    const verify = this.readLockFile(lockPath);
+    if (!verify || verify.holder !== agentId) {
+      // Lock was released underneath us — try to clean up the resurrection
+      try { fs.unlinkSync(lockPath); } catch { /* best effort */ }
+      return null;
+    }
+
     return updated;
   }
 
@@ -221,10 +234,34 @@ export class LockManager {
   // ---- Internal helpers ----
 
   private lockPath(file: string): string {
-    // Sanitize path separators for flat filename
+    // Sanitize path separators for flat filename.
     // "src/auth.ts" → "src#auth.ts"
     // "src/auth.ts#login" → "src#auth.ts#login" (symbol-level)
-    const sanitized = file.replace(/[/\\]/g, "#");
+    //
+    // Edge case: filenames can legally contain '#' on Unix, which would
+    // collide with our symbol-level delimiter. We detect the delimiter by
+    // checking whether the part after the last '#' is a valid identifier
+    // (no dots, no path separators) — that indicates a SymbolResolver key.
+    // Literal '#' in filenames are escaped as '##'.
+    const lastHashIdx = file.lastIndexOf("#");
+    if (lastHashIdx > 0) {
+      const afterHash = file.slice(lastHashIdx + 1);
+      // Symbol delimiter: after-hash is a simple identifier (no / \ .)
+      const isSymbolKey =
+        afterHash.length > 0 &&
+        !afterHash.includes("/") &&
+        !afterHash.includes("\\") &&
+        !afterHash.includes(".");
+      if (isSymbolKey) {
+        const filePart = file
+          .slice(0, lastHashIdx)
+          .replace(/#/g, "##")
+          .replace(/[/\\]/g, "#");
+        return path.join(this.locksDir, `${filePart}#${afterHash}.lock`);
+      }
+    }
+    // Plain file path — escape any literal '#' then replace path separators
+    const sanitized = file.replace(/#/g, "##").replace(/[/\\]/g, "#");
     return path.join(this.locksDir, `${sanitized}.lock`);
   }
 

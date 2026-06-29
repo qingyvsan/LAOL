@@ -17,7 +17,17 @@ function sleep(ms: number): Promise<void> {
  * Returns false in headless/SSH environments — interactive mode requires a GUI.
  */
 function hasGraphicalDisplay(): boolean {
-  if (WIN32) return true; // Windows console is always graphical
+  if (WIN32) {
+    // Detecting headless Windows (SSH, CI, Server Core):
+    // - SSH_TTY / SSH_CONNECTION: SSH session
+    // - CI / BUILD_ID / TF_BUILD / GITHUB_ACTIONS / JENKINS_HOME: CI environment
+    // - SESSIONNAME "Console": physical console session (has GUI)
+    // Default to true for physical desktop sessions.
+    if (process.env.SSH_TTY || process.env.SSH_CONNECTION) return false;
+    if (process.env.CI || process.env.BUILD_ID || process.env.TF_BUILD
+      || process.env.GITHUB_ACTIONS || process.env.JENKINS_HOME) return false;
+    return true;
+  }
   if (DARWIN) return true; // macOS always has WindowServer
   // Linux: check for X11 or Wayland
   return !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
@@ -250,6 +260,7 @@ export class InteractiveTerminalOpener {
     lines.push("- **Diagnostics (tsc, lint, tests)**: `.multiagent/diagnostics.md`");
     lines.push("- **File changes / merges**: `.multiagent/journal/latest-changes.md`");
     lines.push("- **Knowledge / learnings**: `.multiagent/notifications.md`");
+    lines.push("- **API Reference**: `.multiagent/API_REFERENCE.md` — project symbol index, entry points, structure");
     lines.push("");
 
     // Brief instructions
@@ -294,6 +305,10 @@ export class InteractiveTerminalOpener {
     const lines: string[] = [];
     lines.push("@echo off");
     lines.push("setlocal enabledelayedexpansion");
+    // Capture a locale-independent timestamp (YYYYMMDDHHmmss) so log entries
+    // are parseable regardless of the system's region settings.
+    lines.push('for /f "skip=1" %%i in (\'wmic os get localdatetime\') do if not defined LAOL_TS set LAOL_TS=%%i');
+    lines.push("if defined LAOL_TS set LAOL_TS=%LAOL_TS:~0,14%");
     lines.push("title LAOL Agent - " + _task.description.slice(0, 50));
     lines.push("cls");
     lines.push("echo ========================================");
@@ -312,7 +327,7 @@ export class InteractiveTerminalOpener {
     lines.push("echo.");
     // Log start
     lines.push(
-      `echo [%date% %time%] LAOL session started >> "${logPath}"`
+      `echo [%LAOL_TS%] LAOL session started >> "${logPath}"`
     );
     // Verify claude is available before trying to run it
     lines.push("where /q " + this.binaryPath + " >nul 2>nul");
@@ -322,31 +337,31 @@ export class InteractiveTerminalOpener {
     lines.push("  echo Install it with: npm install -g @anthropic-ai/claude-code");
     lines.push("  echo.");
     lines.push(
-      `  echo [%date% %time%] ERROR: ${this.binaryPath} not found >> "${logPath}"`
+      `  echo [%LAOL_TS%] ERROR: ${this.binaryPath} not found >> "${logPath}"`
     );
     lines.push("  pause");
     lines.push("  exit /b 1");
     lines.push(")");
     lines.push(
-      `echo [%date% %time%] ${this.binaryPath} found in PATH, launching... >> "${logPath}"`
+      `echo [%LAOL_TS%] ${this.binaryPath} found in PATH, launching... >> "${logPath}"`
     );
     // Push working directory, then run Claude
     lines.push("pushd " + worktreePath);
     lines.push(
-      `echo [%date% %time%] CWD: %cd% >> "${logPath}"`
+      `echo [%LAOL_TS%] CWD: %cd% >> "${logPath}"`
     );
     lines.push(
-      `echo [%date% %time%] Running: ${this.binaryPath} >> "${logPath}"`
+      `echo [%LAOL_TS%] Running: ${this.binaryPath} >> "${logPath}"`
     );
     lines.push(this.binaryPath);
     lines.push(
-      `echo [%date% %time%] ${this.binaryPath} exited with code %%ERRORLEVEL%% >> "${logPath}"`
+      `echo [%LAOL_TS%] ${this.binaryPath} exited with code %%ERRORLEVEL%% >> "${logPath}"`
     );
     // After Claude exits, delete sentinel.
     // Use double-quote escaping for Windows (cmd.exe does not understand single quotes).
     lines.push(`del /f /q "${sentinelPath}"`);
     lines.push(
-      `echo [%date% %time%] Sentinel deleted >> "${logPath}"`
+      `echo [%LAOL_TS%] Sentinel deleted >> "${logPath}"`
     );
     lines.push("popd");
     lines.push("echo.");

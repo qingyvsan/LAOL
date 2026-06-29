@@ -465,6 +465,10 @@ export class ClaudeCodeExecutor {
       lines.push("**Knowledge / learnings**: Check `.multiagent/notifications.md` for");
       lines.push("knowledge shared by other agents (learnings, summaries, and insights");
       lines.push("from completed tasks).");
+      lines.push("");
+      lines.push("**API Reference**: `.multiagent/API_REFERENCE.md` — full project symbol");
+      lines.push("index. Read (or Grep) this file to find symbols, entry points, and");
+      lines.push("project structure before making changes.");
     }
 
     lines.push("## Instructions");

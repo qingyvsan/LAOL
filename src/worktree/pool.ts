@@ -23,6 +23,9 @@ export class WorktreePool {
   private poolDir: string;
   private poolSize: number;
 
+  /** Maximum pool size to prevent unbounded disk usage. */
+  private static readonly MAX_POOL_SIZE = 20;
+
   private available: string[] = [];
   private inUse = new Map<string, string>(); // taskId → worktree path
   private initialized = false;
@@ -99,15 +102,21 @@ export class WorktreePool {
 
     if (this.available.length > 0) {
       wtPath = this.available.pop()!;
-    } else {
+    } else if (this.poolSize < WorktreePool.MAX_POOL_SIZE) {
       // Dynamic expansion — create a new worktree on demand
       wtPath = path.join(this.poolDir, `pool_${this.poolSize++}`);
       try {
         this.createWorktree(wtPath);
       } catch (err) {
         console.error(`[pool] Failed to dynamically create worktree: ${err}`);
+        this.poolSize--; // rollback the increment on failure
         throw err;
       }
+    } else {
+      throw new Error(
+        `Worktree pool exhausted (max ${WorktreePool.MAX_POOL_SIZE}). ` +
+        `Wait for running tasks to complete, or increase pool_size in config.`
+      );
     }
 
     const branch = `agent/${taskId}`;
@@ -156,7 +165,9 @@ export class WorktreePool {
 
   /**
    * Release a worktree back to the pool.
-   * Resets all changes and cleans untracked files.
+   * Only recycles the worktree if cleanup succeeds. A dirty worktree
+   * (e.g. reset failed due to locked files) is discarded so the next
+   * agent doesn't inherit stale state.
    */
   release(taskId: string): void {
     const wtPath = this.inUse.get(taskId);
@@ -165,9 +176,13 @@ export class WorktreePool {
       return;
     }
 
-    this.cleanWorktree(wtPath);
     this.inUse.delete(taskId);
-    this.available.push(wtPath);
+    const cleaned = this.cleanWorktree(wtPath);
+    if (cleaned) {
+      this.available.push(wtPath);
+    } else {
+      console.warn(`[pool] Worktree ${wtPath} not recycled (cleanup failed) — will be removed on shutdown`);
+    }
   }
 
   /**
@@ -232,7 +247,7 @@ export class WorktreePool {
     });
   }
 
-  private cleanWorktree(wtPath: string): void {
+  private cleanWorktree(wtPath: string): boolean {
     try {
       // Detach HEAD (ignore errors — the worktree may already be detached)
       try {
@@ -256,8 +271,12 @@ export class WorktreePool {
         stdio: "pipe",
         timeout: 10_000,
       });
-    } catch {
-      // Best-effort cleanup
+
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[pool] Failed to clean worktree ${wtPath}: ${message}`);
+      return false;
     }
   }
 }
